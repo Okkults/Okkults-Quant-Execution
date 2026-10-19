@@ -54,6 +54,7 @@ def paper_answers(profile: str = "standard") -> list[str]:
     """Full paper-mode script in the required onboarding order."""
     del profile
     return [
+        "",                # 0. signal server URL ("" keeps the default)
         "paper",           # 1. paper/live
         "PKTEST123",       # 2. Alpaca key id
         "SKTEST456",       # 3. Alpaca secret
@@ -170,9 +171,11 @@ class TestWizard:
         mode = stat.S_IMODE(os.stat(env_file).st_mode)
         assert mode == 0o600
 
-        # Paper/live decision comes first, and risk is decided before the
-        # Okkults key is requested.
-        assert "Trading mode" in prompter.questions[0]
+        # The signal URL is asked first (empty keeps the default endpoint),
+        # then the paper/live decision; risk is decided before the Okkults
+        # key is requested.
+        assert "Signal server URL" in prompter.questions[0]
+        assert "Trading mode" in prompter.questions[1]
         trade_i = next(
             i for i, q in enumerate(prompter.questions) if "Max risk per trade" in q
         )
@@ -195,6 +198,7 @@ class TestWizard:
 
     async def test_live_requires_typed_ack(self, tmp_path) -> None:
         script = [
+            "",
             "live",
             "nope",           # wrong acknowledgment -> falls back to paper
             "PK1", "SK1", "5", "30", "false", valid_license(),
@@ -211,6 +215,7 @@ class TestWizard:
 
     async def test_live_ack_saves_live_env(self, tmp_path) -> None:
         script = [
+            "",
             "live",
             "I UNDERSTAND",
             "PK1", "SK1", "5", "30", "false", valid_license(),
@@ -237,7 +242,7 @@ class TestWizard:
             del api_key, secret_key, paper
             return "FAIL — Alpaca rejected the credentials"
 
-        script = ["paper", "PK1", "SK1", "n"]
+        script = ["", "paper", "PK1", "SK1", "n"]
         wizard = OnboardingWizard(
             prompter=ScriptedPrompter(script),
             env_path=str(env_file),
@@ -260,7 +265,7 @@ class TestWizard:
             return "OK — connected"
 
         script = [
-            "paper", "PK1", "SK1", "y", "PK2", "SK2",
+            "", "paper", "PK1", "SK1", "y", "PK2", "SK2",
             "5", "30", "false", valid_license(), "full_auto", "true",
         ]
         wizard = OnboardingWizard(
@@ -275,7 +280,7 @@ class TestWizard:
 
     async def test_risk_caps_reask_instead_of_accepting_oversize(self, tmp_path) -> None:
         script = [
-            "paper", "PK1", "SK1",
+            "", "paper", "PK1", "SK1",
             "15", "5",       # per-trade 15% rejected, then 5%
             "40", "30",      # portfolio 40% rejected, then 30%
             "false", valid_license(), "full_auto", "true",
@@ -292,7 +297,7 @@ class TestWizard:
 
     async def test_risk_fraction_is_rejected(self, tmp_path) -> None:
         script = [
-            "paper", "PK1", "SK1",
+            "", "paper", "PK1", "SK1",
             "0.05", "5",     # fraction rejected, then 5%
             "30", "false", valid_license(), "full_auto", "true",
         ]
@@ -307,7 +312,7 @@ class TestWizard:
 
     async def test_portfolio_below_trade_is_rejected(self, tmp_path) -> None:
         script = [
-            "paper", "PK1", "SK1",
+            "", "paper", "PK1", "SK1",
             "10", "5", "30",  # 5% portfolio < 10% trade -> re-ask 30%
             "false", valid_license(), "full_auto", "true",
         ]
@@ -333,7 +338,7 @@ class TestWizard:
         good = "ok_paper_" + "G" * 30
         bad = "ok_paper_bad"
         script = [
-            "paper", "PK1", "SK1", "5", "30", "false",
+            "", "paper", "PK1", "SK1", "5", "30", "false",
             bad, good, "full_auto", "true",
         ]
         wizard = OnboardingWizard(

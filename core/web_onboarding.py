@@ -176,6 +176,7 @@ class WebOnboardingServer:
         ) * 100
         bootstrap = {
             "token": self.token,
+            "ws_url": self._ws_url,
             "defaults": {
                 "trading_mode": (
                     "paper"
@@ -237,6 +238,19 @@ class WebOnboardingServer:
             return 400, {"ok": False, "error": verdict}
         return 200, {"ok": True, "verdict": verdict}
 
+    def resolve_ws_url(self, payload: dict[str, Any]) -> tuple[str, str | None]:
+        """Parse the signal server URL from the submitted payload."""
+        ws_url = str(payload.get("ws_url") or "").strip() or self._ws_url
+        if not ws_url.startswith(("ws://", "wss://")):
+            return "", "Signal server URL must start with ws:// or wss://."
+        return ws_url, None
+
+    def _probe_for(self, ws_url: str, key: str) -> Any:
+        """Real probe for custom URLs; injected factory keeps default-path tests fake."""
+        if ws_url == self._ws_url:
+            return self._license_probe_factory(key)()
+        return verify_license_probe(ws_url, key)()
+
     def verify_license(
         self, payload: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -246,7 +260,10 @@ class WebOnboardingServer:
         problem = license_error(key)
         if problem:
             return 400, {"ok": False, "error": problem}
-        verdict = _await(self._license_probe_factory(key)())
+        ws_url, url_problem = self.resolve_ws_url(payload)
+        if url_problem:
+            return 400, {"ok": False, "error": url_problem}
+        verdict = _await(self._probe_for(ws_url, key))
         if verdict is not None and "rejected" in verdict:
             return 400, {"ok": False, "error": verdict}
         return 200, {"ok": True, "verdict": verdict or "license verified"}
@@ -319,7 +336,10 @@ class WebOnboardingServer:
         problem = license_error(license_key)
         if problem:
             return 400, {"ok": False, "error": problem}
-        license_verdict = _await(self._license_probe_factory(license_key)())
+        ws_url, url_problem = self.resolve_ws_url(payload)
+        if url_problem:
+            return 400, {"ok": False, "error": url_problem}
+        license_verdict = _await(self._probe_for(ws_url, license_key))
         if license_verdict is not None and "rejected" in license_verdict:
             return 400, {"ok": False, "error": license_verdict}
 
@@ -342,7 +362,7 @@ class WebOnboardingServer:
         answers.probes["license"] = (
             "verified" if license_verdict is None else "saved (probe failed)"
         )
-        persist_answers(answers, self.current, self.env_path, self._ws_url)
+        persist_answers(answers, self.current, self.env_path, ws_url)
         self.answers = answers
         return 200, {
             "ok": True,
@@ -589,6 +609,9 @@ HTML_PAGE = r"""<!doctype html>
   <section class="card" id="s4">
     <h1>Connect the signal server</h1>
     <p class="sub">Your Okkults license authenticates the signal stream.</p>
+    <label>Signal server URL</label>
+    <input id="wsurl" type="text" placeholder="wss://okkults-api.okkults.workers.dev/v1/stream" autocomplete="off">
+    <div class="hint">Paste exactly the endpoint your operator gave you (test rigs look like ws://192.168.x.x:8000/v1/stream).</div>
     <label>Okkults API key <span class="chip" id="licenseChip"></span></label>
     <input id="license" type="password" placeholder="ok_paper_... / ok_live_..." autocomplete="off">
     <label>Execution mode</label>
@@ -636,6 +659,7 @@ const state = {
   max_trade_pct: D.max_trade_pct,
   max_portfolio_pct: D.max_portfolio_pct,
   allow_short_selling: D.allow_short_selling,
+  ws_url: BOOT.ws_url || "",
   license_key: "",
   execution_mode: D.execution_mode,
   local_exit_failsafe: D.local_exit_failsafe,
@@ -727,17 +751,20 @@ $("b4").onclick = () => show(3);
 
 // step 4
 $("licenseChip").textContent = X.has_license ? "saved " + X.license_masked : "none saved";
+$("wsurl").value = state.ws_url;
 $("execMode").value = state.execution_mode;
 $("failsafe").checked = state.local_exit_failsafe;
 $("n4").onclick = async () => {
   fail("e4", "");
   const key = $("license").value.trim();
+  state.ws_url = $("wsurl").value.trim();
+  if (!state.ws_url) return fail("e4", "Enter the signal server URL.");
   if (!key && !X.has_license) return fail("e4", "Paste your Okkults license key.");
   state.license_key = key;
   state.execution_mode = $("execMode").value;
   state.local_exit_failsafe = $("failsafe").checked;
   const btn = $("n4"); busy(btn, true, "Verify & continue");
-  const r = await api("/api/verify-license", { license_key: key });
+  const r = await api("/api/verify-license", { license_key: key, ws_url: state.ws_url });
   busy(btn, false, "Verify & continue");
   if (!r.data.ok) return fail("e4", r.data.error || "License check failed.");
   $("e4").className = "ok"; $("e4").textContent = r.data.verdict || "verified";
@@ -749,6 +776,7 @@ $("b5").onclick = () => show(4);
 function summarize() {
   const rows = [
     ["Account", state.trading_mode === "live" ? "LIVE — real money" : "Paper"],
+    ["Signal server", state.ws_url || "(default)"],
     ["Max risk per trade", state.max_trade_pct + "%"],
     ["Max total risk at one time", state.max_portfolio_pct + "%"],
     ["Short selling", state.allow_short_selling ? "enabled" : "disabled"],

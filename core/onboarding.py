@@ -271,6 +271,19 @@ class OnboardingWizard:
     # ------------------------------------------------------------------ #
     async def run(self) -> WizardAnswers:
         self.security_notice()
+        # Signal-endpoint lane: the wizard default is the production engine.
+        # A test rig runs its own server — allow pasting a ws:// LAN URL here
+        # so the license probe (and the .env we write) point at it.
+        saved_url = self._ws_url
+        asked_url = self._prompt.text(
+            "Signal server URL (ws:// or wss:// …/v1/stream)",
+            default=saved_url,
+        ).strip()
+        if asked_url and asked_url != saved_url:
+            self._ws_url = asked_url
+            self._license_probe_factory = (
+                lambda key: verify_license_probe(self._ws_url, key)
+            )
         try:
             current = read_env_file(self._env_path)
             await self._trading_mode_lane(current)
