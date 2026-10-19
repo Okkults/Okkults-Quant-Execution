@@ -1,0 +1,8 @@
+# Okkults Quant Execution — runtime dependencies (verified on Python 3.11)
+alpaca-py==0.44.0
+websockets==17.2
+aiohttp==3.14.5
+pydantic==2.14.1
+pydantic-settings==2.16.0
+rich==15.0.0
+python-dotenv==1.2.4
