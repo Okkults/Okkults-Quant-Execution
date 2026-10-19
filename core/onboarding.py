@@ -90,9 +90,15 @@ def verify_license_probe(
                         return None  # noqa: TRY300
                     if frame.get("event") in ("SYSTEM_PING", "PING"):
                         continue
-                    # Any accepted frame that is not a heartbeat/subscribe
-                    # still proves the stream is live and readable.
-                    return None  # noqa: TRY300
+                    # Reached a real WS server but it never confirmed a
+                    # subscription — that is a MISMATCH (wrong server URL).
+                    return (
+                        "connected, but the server never confirmed your "
+                        "license (no SUBSCRIBED frame). Usually this means "
+                        "'Signal server URL' points somewhere else than the "
+                        "server that issued this key — re-check the ws:// "
+                        "URL your operator gave you."
+                    )
         except Exception as exc:  # noqa: BLE001 — probe must never crash setup
             name = type(exc).__name__
             code = getattr(getattr(exc, "rcvd", None), "code", None)
