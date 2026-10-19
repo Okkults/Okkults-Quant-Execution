@@ -95,6 +95,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="run a full simulated signal cycle with no credentials",
     )
+    parser.add_argument(
+        "--no-hud",
+        action="store_true",
+        help="disable the live dashboard (account/positions/event feed panel)",
+    )
     return parser.parse_args(argv)
 
 
@@ -210,10 +215,11 @@ async def preflight(settings: Settings) -> bool:
     return summary["status"] == "ACTIVE"
 
 
-async def run_loop(settings: Settings) -> None:
+async def run_loop(settings: Settings, hud: bool = True) -> None:
     from datetime import datetime
 
     from brokers.alpaca_client import AlpacaBroker
+    from core.dashboard import EventFeed, ObservingBroker, observing_callbacks, run_dashboard
     from core.executor import SignalExecutor, seconds_until_next_open_cross
     from signals.listener import SignalListener
     from signals.protocol import ET
@@ -229,11 +235,13 @@ async def run_loop(settings: Settings) -> None:
             "to arm.[/bold red]"
         )
         return
-    executor = SignalExecutor(broker=broker, settings=settings)
+    feed = EventFeed()
+    observing = ObservingBroker(broker, feed)
+    executor = SignalExecutor(broker=observing, settings=settings)
     listener = SignalListener(
         ws_url=settings.OKKULTS_WS_URL,
         license_key=settings.OKKULTS_LICENSE_KEY,
-        callbacks=executor.callbacks(),
+        callbacks=observing_callbacks(executor.callbacks(), feed),
         broker_status=lambda: broker.connected,
     )
     tasks = [
@@ -250,6 +258,15 @@ async def run_loop(settings: Settings) -> None:
         "Press Ctrl+C to stop (open positions are loudly confirmed, never silently abandoned)."
     )
     console.print("[dim]Entry window: 3:50 PM ET · Exit: 9:30:15 AM ET open cross[/dim]")
+    if hud:
+        tasks.append(
+            asyncio.create_task(
+                run_dashboard(console, observing, feed, lambda: listener.connected),
+                name="dashboard",
+            )
+        )
+    else:
+        console.print("[dim]HUD disabled — signals and orders will print as text lines.[/dim]")
     try:
         await asyncio.gather(*tasks)
     finally:
@@ -321,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
         console.print("[red]Pre-flight failed. Re-run `python main.py --onboard` or edit .env.[/red]")
         return 1
 
-    asyncio.run(run_loop(settings))
+    asyncio.run(run_loop(settings, hud=not parsed.no_hud))
     return 0
 
 
