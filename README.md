@@ -13,16 +13,65 @@ it opened into the 9:30:15 AM opening cross. No resting stops are placed.
 Open-source and non-custodial: it executes on **your** broker, with **your**
 keys, on **your** machine.
 
-## Quickstart (local)
+## Install from public GitHub — step by step
+
+Works in the macOS/Linux Terminal, iTerm, or VS Code's terminal
+(`Terminal → New Terminal`). A GitHub URL by itself is **not** a command:
+you must prefix it with `git clone`.
+
+### 1. Clone the repo
 
 ```bash
-python3.11 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+git clone https://github.com/Okkults/Okkults-Quant-Execution.git
+cd Okkults-Quant-Execution
+```
+
+### 2. Check Python 3.11
+
+```bash
+python3.11 --version
+```
+
+If that fails: macOS `brew install python@3.11`; Ubuntu/Debian
+`sudo apt install python3.11 python3.11-venv`; Windows install Python 3.11
+from python.org and tick **Add Python to PATH**.
+
+### 3. Create the virtual environment and install
+
+macOS/Linux:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+Windows PowerShell:
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Your prompt should now start with `(.venv)`.
+
+### 4. Prove it works with zero keys
+
+```bash
+python main.py --mock
+```
+
+You should see a simulated 12-ticker batch, 12 `FILLED` rows, and a PnL table.
+
+### 5. Start the real terminal
+
+```bash
 python main.py
 ```
 
-No config file needed — the terminal onboarding wizard launches and walks
-you through, in this order:
+No config file needed — the onboarding wizard launches and walks you
+through, in this order:
 
 1. **Security notice** — the non-custodial architecture, up front
 2. **Paper or live** — paper is the default; live requires typing `I UNDERSTAND`
@@ -34,20 +83,18 @@ you through, in this order:
    Enter; requires an interactive TTY) and the local failsafe toggle
 7. **Health check** — real equity fetch, then **SYSTEM ARMED**
 
+### 6. Later runs
+
+```bash
+cd Okkults-Quant-Execution
+source .venv/bin/activate        # Windows: .venv\Scripts\Activate.ps1
+python main.py
+```
+
 Everything lands in a `chmod 600 .env` written atomically. Re-runs skip the
 wizard when config is valid; `--onboard` forces it again. The client never
 places resting stop orders, and it tracks only positions it opens itself —
 pre-existing broker holdings are never touched.
-
-### Prove it first — zero credentials
-
-```bash
-python main.py --mock
-```
-
-Simulates the complete cycle with a fake $50,000 account: 12-ticker batch →
-concurrent fire (<200 ms) → no resting stops → 9:30 open-cross exit → PnL
-table.
 
 ### Flags
 
