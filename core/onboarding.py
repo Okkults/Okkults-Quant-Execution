@@ -85,6 +85,26 @@ def verify_license_probe(
     return probe
 
 
+def humanize_license_rejection(verdict: str, ws_url: str, key: str) -> str:
+    """Translate a probe rejection into fix-it guidance when we can.
+
+    The classic false alarm: a TEST key (ok_paper_test_…) probed against
+    the PRODUCTION engine because the operator never changed the URL
+    field. Name that mistake instead of showing raw (InvalidStatus).
+    """
+    if "rejected" not in verdict:
+        return verdict
+    if ws_url == DEFAULT_WS_URL and key.startswith("ok_paper_test_"):
+        return (
+            "This is a TEST license key — it only works on the test rig, not on "
+            f"production ({DEFAULT_WS_URL}). 'Signal server URL' still contains "
+            "the production address: DELETE it and paste the ws:// endpoint your "
+            "operator gave you (e.g. ws://192.168.x.x:8000/v1/stream), then "
+            "verify again."
+        )
+    return verdict
+
+
 class Prompter(Protocol):
     """Interactive-I/O boundary the wizard renders through."""
 
@@ -478,6 +498,7 @@ class OnboardingWizard:
                 continue
             console.print("[dim]Probing the signal server…[/dim]")
             verdict = await self._license_probe_factory(raw)()
+            verdict = humanize_license_rejection(verdict, self._ws_url, raw)
             if verdict is not None:
                 if "rejected" in verdict:
                     console.print(f"[bold red]✗ {verdict}[/bold red]")

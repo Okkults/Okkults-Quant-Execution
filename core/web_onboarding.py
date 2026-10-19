@@ -26,6 +26,7 @@ from config.settings import HARD_MAX_PORTFOLIO_PCT, HARD_MAX_TRADE_PCT
 from core.envwriter import mask_secret, read_env_file
 from core.onboarding import (
     DEFAULT_WS_URL,
+    humanize_license_rejection,
     LIVE_ACK_WORDS,
     BrokerProbe,
     LicenseProbeFactory,
@@ -264,6 +265,7 @@ class WebOnboardingServer:
         if url_problem:
             return 400, {"ok": False, "error": url_problem}
         verdict = _await(self._probe_for(ws_url, key))
+        verdict = humanize_license_rejection(verdict, ws_url, key)
         if verdict is not None and "rejected" in verdict:
             return 400, {"ok": False, "error": verdict}
         return 200, {"ok": True, "verdict": verdict or "license verified"}
@@ -340,6 +342,9 @@ class WebOnboardingServer:
         if url_problem:
             return 400, {"ok": False, "error": url_problem}
         license_verdict = _await(self._probe_for(ws_url, license_key))
+        license_verdict = humanize_license_rejection(
+            license_verdict, ws_url, license_key
+        )
         if license_verdict is not None and "rejected" in license_verdict:
             return 400, {"ok": False, "error": license_verdict}
 
