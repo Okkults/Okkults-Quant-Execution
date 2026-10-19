@@ -72,7 +72,11 @@ python main.py
 
 No config file needed — a local onboarding page opens in your browser
 (`http://127.0.0.1:<random-port>`, one-time token, never exposed to the
-network). It walks you through, in this order:
+network). You will need a signal-server WebSocket URL and **your personal**
+`ok_paper_...` license key from the server operator — setup guide:
+[okkults-api-test-v1.00](https://github.com/Okkults/okkults-api-test-v1.00#documentation).
+
+It walks you through, in this order:
 
 1. **Security notice** — the non-custodial architecture, up front
 2. **Paper or live** — paper is the default; live requires typing `I UNDERSTAND`
