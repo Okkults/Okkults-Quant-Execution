@@ -27,6 +27,8 @@ from rich.table import Table
 from core.envwriter import mask_secret, merge_env_updates, read_env_file, write_env_file
 
 __all__ = [
+    "PROFILE_ORDER",
+    "RISK_PROFILES",
     "ConsolePrompter",
     "OnboardingWizard",
     "Prompter",
@@ -43,6 +45,27 @@ LICENSE_PREFIXES = ("ok_live_", "ok_paper_")
 LIVE_ACK_WORDS = "I UNDERSTAND"
 MAX_ALLOCATION_PCT_WARN = 0.10
 DEFAULT_WS_URL = "wss://okkults-api.okkults.workers.dev/v1/stream"
+
+# Install-time risk profiles. Level maps to concrete caps; `custom` walks
+# every knob individually. Standard matches the website dashboard defaults.
+RISK_PROFILES: dict[str, dict[str, float]] = {
+    "conservative": {
+        "max_portfolio_risk_pct": 0.20,
+        "max_trade_allocation_pct": 0.05,
+        "disaster_stop_pct": 0.05,
+    },
+    "standard": {
+        "max_portfolio_risk_pct": 0.30,
+        "max_trade_allocation_pct": 0.10,
+        "disaster_stop_pct": 0.07,
+    },
+    "aggressive": {
+        "max_portfolio_risk_pct": 0.40,
+        "max_trade_allocation_pct": 0.15,
+        "disaster_stop_pct": 0.10,
+    },
+}
+PROFILE_ORDER = ["conservative", "standard", "aggressive", "custom"]
 
 
 def verify_license_probe(
@@ -162,6 +185,7 @@ class WizardAnswers:
     alpaca_secret_key: str = ""
     alpaca_is_paper: bool = True
     execution_mode: str = "full_auto"
+    risk_profile: str = "standard"
     max_portfolio_risk_pct: float = 0.30
     max_trade_allocation_pct: float = 0.10
     per_trade_notional_cap: float | None = None
@@ -202,14 +226,11 @@ class OnboardingWizard:
         self.security_notice()
         try:
             current = read_env_file(self._env_path)
-            lane = self._prompt.choice(
-                "Setup flow", ["quick", "custom"], default="quick"
-            )
             await self._license_lane(current)
             await self._broker_lane()
             await self._credentials_lane()
             await self._execution_lane()
-            await self._risk_lane(current, deep=lane == "custom")
+            await self._risk_lane()
         except EOFError:
             console.print(
                 "[yellow][!] Input stream closed (EOF) — setup paused after "
@@ -313,8 +334,48 @@ class OnboardingWizard:
             )
         self.answers.execution_mode = mode
 
-    async def _risk_lane(self, current: dict[str, str], deep: bool) -> None:
-        console.print(Rule("[bold]Step 5 — Risk caps"))
+    async def _risk_lane(self) -> None:
+        """Risk profile chooser + custom knob walk + failsafe toggle."""
+        console.print(Rule("[bold]Step 5 — Risk profile"))
+        profile = self._prompt.choice(
+            "Risk profile (per-trade sizing vs max risk budget)",
+            PROFILE_ORDER,
+            default="standard",
+        )
+        if profile != "custom":
+            mapped = RISK_PROFILES[profile]
+            self.answers.risk_profile = profile
+            self.answers.max_portfolio_risk_pct = mapped["max_portfolio_risk_pct"]
+            self.answers.max_trade_allocation_pct = mapped["max_trade_allocation_pct"]
+            self.answers.disaster_stop_pct = mapped["disaster_stop_pct"]
+            if profile == "aggressive":
+                console.print(
+                    allocation_warning(self.answers.max_trade_allocation_pct)
+                )
+                if not self._prompt.confirm(
+                    "Override the risk-parity ceiling anyway?", default=False
+                ):
+                    fallback = RISK_PROFILES["standard"]
+                    self.answers.risk_profile = "standard"
+                    self.answers.max_portfolio_risk_pct = fallback["max_portfolio_risk_pct"]
+                    self.answers.max_trade_allocation_pct = fallback["max_trade_allocation_pct"]
+                    self.answers.disaster_stop_pct = fallback["disaster_stop_pct"]
+                    console.print(
+                        "[green]Kept STANDARD caps: 10% per ticker / 30% batch ceiling.[/green]"
+                    )
+        else:
+            self.answers.risk_profile = "custom"
+            await self._custom_risk_knobs()
+
+        self.answers.local_exit_failsafe = self._prompt.confirm(
+            "LOCAL_EXIT_FAILSAFE — auto-liquidate at 9:30:16 AM ET if the "
+            "server's EXIT_SIGNAL never arrives?",
+            default=True,
+        )
+        self._print_profile_summary()
+
+    async def _custom_risk_knobs(self) -> None:
+        """Custom profile: every risk knob walked individually."""
         portfolio = self._prompt.float(
             "MAX_PORTFOLIO_RISK_PCT (total exposure ceiling, e.g. 0.30)",
             self.answers.max_portfolio_risk_pct,
@@ -348,10 +409,34 @@ class OnboardingWizard:
         self.answers.per_trade_notional_cap = cap if cap > 0 else None
         self.answers.cash_reserve = max(0.0, reserve)
         self.answers.disaster_stop_pct = min(max(0.0, stop_pct), 0.5)
-        self.answers.local_exit_failsafe = self._prompt.confirm(
-            "LOCAL_EXIT_FAILSAFE — auto-liquidate at 9:30:16 AM ET if the "
-            "server's EXIT_SIGNAL never arrives?",
-            default=True,
+
+    def _print_profile_summary(self) -> None:
+        """Show the chosen caps as an institutional summary card."""
+        a = self.answers
+        table = Table(title=f"Risk profile — {a.risk_profile}", header_style="bold magenta")
+        table.add_column("Knob", style="bold")
+        table.add_column("Value", justify="right")
+        table.add_row(
+            "Max risk per trade (per ticker)",
+            f"{a.max_trade_allocation_pct * 100:.0f}%",
+        )
+        table.add_row(
+            "Max batch risk (portfolio ceiling)",
+            f"{a.max_portfolio_risk_pct * 100:.0f}%",
+        )
+        table.add_row("Disaster stop (defaults; payload may override)", f"{a.disaster_stop_pct * 100:.0f}%")
+        if a.per_trade_notional_cap is not None:
+            table.add_row("Per-trade notional cap", f"${a.per_trade_notional_cap:,.0f}")
+        if a.cash_reserve:
+            table.add_row("Cash reserve", f"${a.cash_reserve:,.0f}")
+        table.add_row("Execution mode", a.execution_mode)
+        table.add_row("Local failsafe", "ARMED" if a.local_exit_failsafe else "disabled")
+        console.print(table)
+        worst_gap = a.max_trade_allocation_pct * 20
+        console.print(
+            f"[dim]Worst single-gap math: a -20% overnight gap on one report "
+            f"costs about {worst_gap:.1f}% of equity "
+            f"(sizing {a.max_trade_allocation_pct * 100:.0f}% × gap).[/dim]"
         )
 
     # ------------------------------------------------------------------ #
@@ -401,10 +486,11 @@ class OnboardingWizard:
         )
         table.add_row("Exec mode", self.answers.execution_mode)
         table.add_row(
-            "Risk caps",
-            f"portfolio {self.answers.max_portfolio_risk_pct * 100:.0f}% / "
-            f"ticker {self.answers.max_trade_allocation_pct * 100:.0f}% / "
-            f"disaster stop {self.answers.disaster_stop_pct * 100:.0f}%",
+            "Risk profile",
+            f"{self.answers.risk_profile} — "
+            f"{self.answers.max_trade_allocation_pct * 100:.0f}% per ticker / "
+            f"{self.answers.max_portfolio_risk_pct * 100:.0f}% batch / "
+            f"{self.answers.disaster_stop_pct * 100:.0f}% stop",
         )
         table.add_row(
             "Failsafe", "ARMED" if self.answers.local_exit_failsafe else "disabled"

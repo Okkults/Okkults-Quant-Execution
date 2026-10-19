@@ -105,22 +105,17 @@ class TestEnvWriter:
 # --------------------------------------------------------------------- #
 # wizard E2E with scripted prompter
 # --------------------------------------------------------------------- #
-def quick_answers() -> list[str]:
-    """Scripted answers for one full quick-lane run."""
+def quick_answers(profile: str = "standard") -> list[str]:
+    """Scripted answers for one full wizard run ending with a risk profile."""
     return [
-        "quick",                     # setup flow lane
-        valid_license(),             # license key
-        "alpaca",                    # broker
-        "PKTEST123",                 # alpaca key id
-        "SKTEST456",                 # alpaca secret
-        "paper",                     # endpoint
-        "full_auto",                 # execution mode
-        "0.30",                      # portfolio pct
-        "0.10",                      # per-ticker pct
-        "0",                         # notional cap
-        "0",                         # cash reserve
-        "0.07",                      # disaster stop
-        "true",                      # failsafe
+        valid_license(),
+        "alpaca",
+        "PKTEST123",
+        "SKTEST456",
+        "paper",
+        "full_auto",
+        profile,           # risk profile
+        "true",            # failsafe
     ]
 
 
@@ -178,13 +173,13 @@ class TestWizard:
 
     async def test_custom_lane_oversized_allocation_gets_capped(self, tmp_path) -> None:
         answers_script = [
-            "custom",     # lane
-            valid_license(),      # license
+            valid_license(),
             "alpaca",
             "PK1",
             "SK1",
             "paper",
             "semi_auto",
+            "custom",     # risk profile -> walks every knob
             "0.40",       # portfolio
             "0.25",       # per-ticker -> triggers warning
             "n",          # decline override
@@ -204,7 +199,6 @@ class TestWizard:
 
     async def test_live_endpoint_requires_typed_ack(self, tmp_path) -> None:
         script = [
-            "quick",
             valid_license(),
             "alpaca",
             "PK1",
@@ -212,11 +206,7 @@ class TestWizard:
             "live",
             "nope",       # WRONG acknowledgment -> falls back to paper
             "full_auto",
-            "0.30",
-            "0.10",
-            "0",
-            "0",
-            "0.07",
+            "standard",
             "true",
         ]
         wizard = OnboardingWizard(
@@ -227,6 +217,101 @@ class TestWizard:
         )
         await wizard.run()
         assert wizard.answers.alpaca_is_paper is True
+
+
+# --------------------------------------------------------------------- #
+# risk profiles (install-time custom profile selection)
+# --------------------------------------------------------------------- #
+class TestRiskProfiles:
+    def profile_script(self, profile_answer: str, extra: list[str]) -> list[str]:
+        """Shared pre-profile script; the profile answer tail is caller-built."""
+        return [
+            valid_license(),
+            "alpaca",
+            "PK1",
+            "SK1",
+            "paper",
+            "full_auto",
+            profile_answer,
+            *extra,
+        ]
+
+    async def _run(self, tmp_path, script) -> OnboardingWizard:
+        wizard = OnboardingWizard(
+            prompter=ScriptedPrompter(script),
+            env_path=str(tmp_path / ".env"),
+            license_probe_factory=fake_license_probe_factory,
+            broker_probe=fake_broker_probe,
+        )
+        await wizard.run()
+        return wizard
+
+    async def test_conservative_profile_caps(self, tmp_path) -> None:
+        from core.onboarding import RISK_PROFILES
+
+        wizard = await self._run(
+            tmp_path, self.profile_script("conservative", ["true"])
+        )
+        assert wizard.answers.risk_profile == "conservative"
+        assert wizard.answers.max_trade_allocation_pct == RISK_PROFILES["conservative"]["max_trade_allocation_pct"] == 0.05
+        assert wizard.answers.max_portfolio_risk_pct == 0.20
+        assert wizard.answers.disaster_stop_pct == 0.05
+        written = read_env_file(tmp_path / ".env")
+        assert written["MAX_TRADE_ALLOCATION_PCT"] == "0.05"
+
+    async def test_standard_is_default_profile(self, tmp_path) -> None:
+        wizard = await self._run(tmp_path, self.profile_script("", ["true"]))
+        assert wizard.answers.risk_profile == "standard"
+        assert wizard.answers.max_trade_allocation_pct == 0.10
+
+    async def test_aggressive_declining_override_falls_back_to_standard(
+        self, tmp_path
+    ) -> None:
+        wizard = await self._run(
+            tmp_path, self.profile_script("aggressive", ["n", "true"])
+        )
+        assert wizard.answers.risk_profile == "standard"
+        assert wizard.answers.max_trade_allocation_pct == 0.10
+        assert wizard.answers.max_portfolio_risk_pct == 0.30
+
+    async def test_aggressive_confirmed_override_keeps_aggressive(
+        self, tmp_path
+    ) -> None:
+        wizard = await self._run(
+            tmp_path, self.profile_script("aggressive", ["y", "true"])
+        )
+        assert wizard.answers.risk_profile == "aggressive"
+        assert wizard.answers.max_trade_allocation_pct == 0.15
+        assert wizard.answers.max_portfolio_risk_pct == 0.40
+        written = read_env_file(tmp_path / ".env")
+        assert written["MAX_PORTFOLIO_RISK_PCT"] == "0.4"
+
+    async def test_custom_profile_walks_every_knob(self, tmp_path) -> None:
+        script = [
+            valid_license(),
+            "alpaca",
+            "PK1",
+            "SK1",
+            "paper",
+            "full_auto",
+            "custom",       # profile
+            "0.25",         # portfolio
+            "0.06",         # per-ticker
+            "5000",         # notional cap
+            "1000",         # cash reserve
+            "0.08",         # disaster stop
+            "false",        # failsafe
+        ]
+        wizard = await self._run(tmp_path, script)
+        assert wizard.answers.risk_profile == "custom"
+        assert wizard.answers.max_trade_allocation_pct == 0.06
+        assert wizard.answers.per_trade_notional_cap == 5000.0
+        assert wizard.answers.cash_reserve == 1000.0
+        assert wizard.answers.disaster_stop_pct == 0.08
+        assert wizard.answers.local_exit_failsafe is False
+        written = read_env_file(tmp_path / ".env")
+        assert written["PER_TRADE_NOTIONAL_CAP"] == "5000.0"
+        assert written["LOCAL_EXIT_FAILSAFE"] == "false"
 
 
 # --------------------------------------------------------------------- #
