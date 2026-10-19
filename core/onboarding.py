@@ -85,14 +85,17 @@ def verify_license_probe(
     return probe
 
 
-def humanize_license_rejection(verdict: str, ws_url: str, key: str) -> str:
+def humanize_license_rejection(
+    verdict: str | None, ws_url: str, key: str
+) -> str | None:
     """Translate a probe rejection into fix-it guidance when we can.
 
     The classic false alarm: a TEST key (ok_paper_test_…) probed against
     the PRODUCTION engine because the operator never changed the URL
     field. Name that mistake instead of showing raw (InvalidStatus).
+    `verdict` is None when the probe SUCCEEDED — pass it through.
     """
-    if "rejected" not in verdict:
+    if verdict is None or "rejected" not in verdict:
         return verdict
     if ws_url == DEFAULT_WS_URL and key.startswith("ok_paper_test_"):
         return (
