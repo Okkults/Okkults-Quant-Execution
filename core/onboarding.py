@@ -67,14 +67,39 @@ def verify_license_probe(
 
     async def probe() -> str | None:
         try:
+            import asyncio
+            import json
+
             import websockets
 
             async with websockets.connect(
                 f"{ws_url}?license={key}", open_timeout=timeout_s
-            ):
-                return None
+            ) as socket:
+                # Wait for the server's SUBSCRIBED confirmation instead of
+                # trusting a bare handshake: some servers accept the upgrade
+                # and then close with 4xxx auth codes.
+                while True:
+                    raw = await asyncio.wait_for(
+                        socket.recv(), timeout=timeout_s
+                    )
+                    try:
+                        frame = json.loads(raw) if isinstance(raw, str) else {}
+                    except ValueError:
+                        continue
+                    if frame.get("event") == "SUBSCRIBED":
+                        return None  # noqa: TRY300
+                    if frame.get("event") in ("SYSTEM_PING", "PING"):
+                        continue
+                    # Any accepted frame that is not a heartbeat/subscribe
+                    # still proves the stream is live and readable.
+                    return None  # noqa: TRY300
         except Exception as exc:  # noqa: BLE001 — probe must never crash setup
             name = type(exc).__name__
+            code = getattr(getattr(exc, "rcvd", None), "code", None)
+            if code == 4001:
+                return "signal server rejected the license (code 4001: invalid key)"
+            if code == 4002:
+                return "signal server rejected the license (code 4002: live key on paper rig)"
             if name in ("InvalidStatus", "InvalidHandshake", "ConnectionClosed"):
                 return f"signal server rejected the license ({name})"
             return (
