@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 from rich.console import Console
@@ -40,7 +41,9 @@ __all__ = [
     "WizardAnswers",
     "allocation_warning",
     "alpaca_key_error",
+    "build_env_values",
     "license_error",
+    "persist_answers",
     "probe_broker_credentials",
     "risk_pct_error",
     "verify_license_probe",
@@ -200,6 +203,47 @@ class WizardAnswers:
 
 LicenseProbeFactory = Callable[[str], Callable[[], Awaitable[str | None]]]
 BrokerProbe = Callable[[str, str, bool], Awaitable[str]]
+
+
+def build_env_values(
+    answers: WizardAnswers, ws_url: str = DEFAULT_WS_URL
+) -> dict[str, str]:
+    """Serialize wizard answers into the exact ``.env`` key/value shape."""
+    values = {
+        "OKKULTS_LICENSE_KEY": answers.license_key,
+        "OKKULTS_WS_URL": ws_url,
+        "BROKER": answers.broker,
+        "ALPACA_API_KEY": answers.alpaca_api_key,
+        "ALPACA_SECRET_KEY": answers.alpaca_secret_key,
+        "ALPACA_IS_PAPER": "true" if answers.alpaca_is_paper else "false",
+        "LIVE_TRADING_ACK": "YES" if not answers.alpaca_is_paper else "NO",
+        "EXECUTION_MODE": answers.execution_mode,
+        "MAX_PORTFOLIO_RISK_PCT": f"{answers.max_portfolio_risk_pct}",
+        "MAX_TRADE_ALLOCATION_PCT": f"{answers.max_trade_allocation_pct}",
+        "CASH_RESERVE": f"{answers.cash_reserve}",
+        "ALLOW_SHORT_SELLING": (
+            "true" if answers.allow_short_selling else "false"
+        ),
+        "LOCAL_EXIT_FAILSAFE": (
+            "true" if answers.local_exit_failsafe else "false"
+        ),
+    }
+    if answers.per_trade_notional_cap is not None:
+        values["PER_TRADE_NOTIONAL_CAP"] = f"{answers.per_trade_notional_cap}"
+    return values
+
+
+def persist_answers(
+    answers: WizardAnswers,
+    current: dict[str, str],
+    env_path: str | Path,
+    ws_url: str = DEFAULT_WS_URL,
+) -> None:
+    """Merge answers over the current file, drop legacy keys, write 0600."""
+    merged = merge_env_updates(current, build_env_values(answers, ws_url))
+    # Legacy knob removed from the client: never carry it forward.
+    merged.pop("DISASTER_STOP_PCT", None)
+    write_env_file(merged, env_path)
 
 
 class OnboardingWizard:
@@ -494,31 +538,10 @@ class OnboardingWizard:
     # persistence + health check
     # ------------------------------------------------------------------ #
     def env_values(self) -> dict[str, str]:
-        a = self.answers
-        values = {
-            "OKKULTS_LICENSE_KEY": a.license_key,
-            "OKKULTS_WS_URL": self._ws_url,
-            "BROKER": a.broker,
-            "ALPACA_API_KEY": a.alpaca_api_key,
-            "ALPACA_SECRET_KEY": a.alpaca_secret_key,
-            "ALPACA_IS_PAPER": "true" if a.alpaca_is_paper else "false",
-            "LIVE_TRADING_ACK": "YES" if not a.alpaca_is_paper else "NO",
-            "EXECUTION_MODE": a.execution_mode,
-            "MAX_PORTFOLIO_RISK_PCT": f"{a.max_portfolio_risk_pct}",
-            "MAX_TRADE_ALLOCATION_PCT": f"{a.max_trade_allocation_pct}",
-            "CASH_RESERVE": f"{a.cash_reserve}",
-            "ALLOW_SHORT_SELLING": "true" if a.allow_short_selling else "false",
-            "LOCAL_EXIT_FAILSAFE": "true" if a.local_exit_failsafe else "false",
-        }
-        if a.per_trade_notional_cap is not None:
-            values["PER_TRADE_NOTIONAL_CAP"] = f"{a.per_trade_notional_cap}"
-        return values
+        return build_env_values(self.answers, self._ws_url)
 
     def _persist(self, current: dict[str, str]) -> None:
-        merged = merge_env_updates(current, self.env_values())
-        # Legacy knob removed from the client: never carry it forward.
-        merged.pop("DISASTER_STOP_PCT", None)
-        write_env_file(merged, self._env_path)
+        persist_answers(self.answers, current, self._env_path, self._ws_url)
         console.print(
             f"[green][OK][/green] Configuration written to {self._env_path} "
             "(atomic write, chmod 600)."

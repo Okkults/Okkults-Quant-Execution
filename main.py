@@ -86,6 +86,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="force the guided onboarding wizard to re-run",
     )
     parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="use the terminal onboarding wizard instead of the browser",
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="run a full simulated signal cycle with no credentials",
@@ -106,8 +111,8 @@ def _settings_or_none() -> Settings | None:
     return settings
 
 
-def resolve_config(force_onboard: bool) -> Settings:
-    """Route by config state — exactly like OpenClaw's bare invocation."""
+def resolve_config(force_onboard: bool, prefer_cli: bool = False) -> Settings:
+    """Route by config state — browser wizard first, terminal on request."""
     headless = os.environ.get("HEADLESS", "") == "1"
     if not force_onboard:
         settings = _settings_or_none()
@@ -120,11 +125,22 @@ def resolve_config(force_onboard: bool) -> Settings:
             "variables and restart.[/bold red]"
         )
         raise SystemExit(1)
-    console.print("[cyan]Entering onboarding wizard…[/cyan]")
-    from core.onboarding import OnboardingWizard
+    if not prefer_cli:
+        from core.web_onboarding import run_web_onboarding
 
-    wizard = OnboardingWizard(env_path=".env")
-    asyncio.run(wizard.run())
+        console.print("[cyan]Opening browser onboarding…[/cyan]")
+        answers = run_web_onboarding(env_path=".env")
+        if answers is None:
+            console.print(
+                "[red]Setup was not completed — nothing was saved.[/red]"
+            )
+            raise SystemExit(1)
+    else:
+        console.print("[cyan]Entering terminal onboarding wizard…[/cyan]")
+        from core.onboarding import OnboardingWizard
+
+        wizard = OnboardingWizard(env_path=".env")
+        asyncio.run(wizard.run())
     reloaded = load_settings()
     missing = missing_required_fields(reloaded)
     if missing:
@@ -299,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     ensure_env_file()
-    settings = resolve_config(parsed.onboard)
+    settings = resolve_config(parsed.onboard, prefer_cli=parsed.cli)
 
     if not asyncio.run(preflight(settings)):
         console.print("[red]Pre-flight failed. Re-run `python main.py --onboard` or edit .env.[/red]")

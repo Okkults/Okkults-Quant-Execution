@@ -70,8 +70,9 @@ You should see a simulated 12-ticker batch, 12 `FILLED` rows, and a PnL table.
 python main.py
 ```
 
-No config file needed — the onboarding wizard launches and walks you
-through, in this order:
+No config file needed — a local onboarding page opens in your browser
+(`http://127.0.0.1:<random-port>`, one-time token, never exposed to the
+network). It walks you through, in this order:
 
 1. **Security notice** — the non-custodial architecture, up front
 2. **Paper or live** — paper is the default; live requires typing `I UNDERSTAND`
@@ -82,6 +83,9 @@ through, in this order:
 6. **Execution mode** — `full_auto` (fires on signal) or `semi_auto` (you press
    Enter; requires an interactive TTY) and the local failsafe toggle
 7. **Health check** — real equity fetch, then **SYSTEM ARMED**
+
+Prefer the terminal? `python main.py --onboard --cli` runs the same wizard
+step-by-step in the console.
 
 ### 6. Later runs
 
@@ -100,8 +104,9 @@ pre-existing broker holdings are never touched.
 
 | Command | Behavior |
 | --- | --- |
-| `python main.py` | wizard if unconfigured, otherwise armed run loop |
-| `python main.py --onboard` | force the wizard (re-enter/repair config) |
+| `python main.py` | browser onboarding if unconfigured, otherwise armed run loop |
+| `python main.py --onboard` | force browser onboarding (re-enter/repair config) |
+| `python main.py --onboard --cli` | force the terminal wizard instead of the browser |
 | `python main.py --mock` | full simulated cycle, no keys |
 
 ## One-line Docker
@@ -129,7 +134,8 @@ or Render — cheaper than an idle laptop missing the entry window).
   withdrawal path, and never receives your broker credentials.
 - **Credentials never leave your machine.** Keys live in a local `.env`
   (or environment variables), are transmitted only to Alpaca, and are never
-  logged, echoed, or shipped in telemetry.
+  logged, echoed, or shipped in telemetry. Browser onboarding binds to
+  `127.0.0.1` only and requires a random one-time token.
 - **Open source — verify the code.** No backdoors, no key-stealing scripts.
   Grep it yourself: there are zero indicator formulas (ATR, RSI, MACD…) in
   this repo. Prices and exit instructions ride in the wire payload from the
@@ -180,7 +186,7 @@ signals/listener.py ── core/executor.py ── core/risk.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q            # 71 tests: sizing parity, protocol, executor, wizard
+pytest -q            # 80 tests: sizing, protocol, executor, terminal + browser wizard
 mypy .
 ruff check .
 ```
