@@ -1,7 +1,7 @@
 """Interactive Brokers driver — stubbed.
 
 IB Gateway integration is planned for Phase 2. Every execution method
-raises ; only :meth:`connect` runs, and it prints the notice.
+raises; only :meth:`connect` runs, and it prints the notice.
 """
 
 from __future__ import annotations
@@ -12,9 +12,7 @@ from brokers.base import BaseBroker
 
 console = Console()
 
-_NOT_IMPLEMENTED = (
-    "IBKR driver coming soon. Switch BROKER=alpaca in your .env."
-)
+_NOT_IMPLEMENTED = "IBKR driver coming soon. Switch BROKER=alpaca in your .env."
 
 
 class IBKRClient(BaseBroker):
@@ -43,26 +41,17 @@ class IBKRClient(BaseBroker):
         side: str,
         order_type: str,
         limit_price: float | None = None,
-        stop_price: float | None = None,
         client_order_id: str | None = None,
     ) -> dict:  # pragma: no cover - stub
         raise NotImplementedError(_NOT_IMPLEMENTED)
 
-    async def place_bracket_order(
+    async def close_position(
         self,
         symbol: str,
-        qty: int,
-        side: str,
-        stop_price: float,
-        take_profit_price: float | None = None,
-    ) -> dict:  # pragma: no cover - stub
+        percentage: float = 100.0,
+        qty: int | None = None,
+    ) -> dict:  # pragma: no cover
         raise NotImplementedError(_NOT_IMPLEMENTED)
 
-    async def close_all_positions(self) -> list[dict]:  # pragma: no cover
-        raise NotImplementedError(_NOT_IMPLEMENTED)
 
-    async def close_position(self, symbol: str, percentage: float) -> dict:  # pragma: no cover
-        raise NotImplementedError(_NOT_IMPLEMENTED)
-
-    async def cancel_all_orders(self) -> int:  # pragma: no cover
-        raise NotImplementedError(_NOT_IMPLEMENTED)
+__all__ = ["IBKRClient"]

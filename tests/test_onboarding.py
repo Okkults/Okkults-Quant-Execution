@@ -1,15 +1,19 @@
-"""Onboarding tests — routing, validation, atomic env writes, gated persistence."""
+"""Onboarding tests — requested order, validation, verification, env writes."""
 
 import os
 import stat
+from pathlib import Path
 
-from config.settings import load_settings, missing_required_fields
+import pytest
+
+from config.settings import Settings, load_settings, missing_required_fields
 from core.envwriter import mask_secret, merge_env_updates, read_env_file, write_env_file
 from core.onboarding import (
     OnboardingWizard,
     allocation_warning,
     alpaca_key_error,
     license_error,
+    risk_pct_error,
 )
 
 
@@ -46,9 +50,37 @@ def valid_license() -> str:
     return "ok_paper_" + "X" * 30
 
 
-# --------------------------------------------------------------------- #
-# pure validation helpers
-# --------------------------------------------------------------------- #
+def paper_answers(profile: str = "standard") -> list[str]:
+    """Full paper-mode script in the required onboarding order."""
+    del profile
+    return [
+        "paper",           # 1. paper/live
+        "PKTEST123",       # 2. Alpaca key id
+        "SKTEST456",       # 3. Alpaca secret
+        "5",               # 4. risk per trade (%)
+        "30",              # 5. max total risk at one time (%)
+        "false",           # 6. allow short selling
+        valid_license(),   # 7. Okkults API key
+        "full_auto",       # 8. execution mode
+        "true",            # 9. local failsafe
+    ]
+
+
+async def fake_broker_probe(api_key: str, secret_key: str, paper: bool) -> str:
+    assert api_key
+    assert secret_key
+    return f"OK — connected, equity $50,000.00 ({'PAPER' if paper else 'LIVE'})"
+
+
+def fake_license_probe_factory(key: str):
+    assert key.startswith("ok_paper_") or key.startswith("ok_live_")
+
+    async def probe() -> str | None:
+        return None  # server "accepts"
+
+    return probe
+
+
 class TestValidation:
     def test_license_shapes(self) -> None:
         assert license_error("ok_live_ABCDEF") is None
@@ -63,9 +95,19 @@ class TestValidation:
         assert alpaca_key_error("PK123", "PK123") is not None
 
     def test_allocation_warning_text(self) -> None:
-        warning = allocation_warning(0.30)
+        warning = allocation_warning(0.15)
         assert "violates statistical risk parity" in warning
-        assert "30.0%" in warning
+        assert "15.0%" in warning
+        assert "hard 10% cap" in warning
+
+    def test_risk_pct_error(self) -> None:
+        assert risk_pct_error("trade", 0.05, maximum=0.10) is None
+        assert "cannot exceed 10%" in (
+            risk_pct_error("trade", 0.15, maximum=0.10) or ""
+        )
+        assert "greater than 0%" in (
+            risk_pct_error("trade", 0.0, maximum=0.10) or ""
+        )
 
     def test_mock_masking(self) -> None:
         assert mask_secret("ok_live_secretsecret") == "***ret"
@@ -73,13 +115,12 @@ class TestValidation:
         assert mask_secret("small") == "***"
 
 
-# --------------------------------------------------------------------- #
-# env writer: atomic + permissive-safe
-# --------------------------------------------------------------------- #
 class TestEnvWriter:
     def test_write_and_read_roundtrip(self, tmp_path) -> None:
         env_file = tmp_path / ".env"
-        write_env_file({"OKKULTS_LICENSE_KEY": "ok_live_test", "BROKER": "alpaca"}, env_file)
+        write_env_file(
+            {"OKKULTS_LICENSE_KEY": "ok_live_test", "BROKER": "alpaca"}, env_file
+        )
         data = read_env_file(env_file)
         assert data["OKKULTS_LICENSE_KEY"] == "ok_live_test"
 
@@ -102,112 +143,62 @@ class TestEnvWriter:
         assert "supersecret123" not in captured.out
 
 
-# --------------------------------------------------------------------- #
-# wizard E2E with scripted prompter
-# --------------------------------------------------------------------- #
-def quick_answers(profile: str = "standard") -> list[str]:
-    """Scripted answers for one full wizard run ending with a risk profile."""
-    return [
-        valid_license(),
-        "alpaca",
-        "PKTEST123",
-        "SKTEST456",
-        "paper",
-        "full_auto",
-        profile,           # risk profile
-        "true",            # failsafe
-    ]
-
-
-def fake_license_probe_factory(key: str):
-    assert key.startswith("ok_paper_") or key.startswith("ok_live_")
-
-    async def probe() -> str | None:
-        return None  # server "accepts"
-
-    return probe
-
-
-async def fake_broker_probe() -> str:
-    return "OK — connected, equity $50,000.00 (PAPER)"
-
-
 class TestWizard:
     async def test_happy_path_writes_and_verifies(self, tmp_path) -> None:
         env_file = tmp_path / ".env"
+        prompter = ScriptedPrompter(paper_answers())
         wizard = OnboardingWizard(
-            prompter=ScriptedPrompter(quick_answers()),
+            prompter=prompter,
             env_path=str(env_file),
             license_probe_factory=fake_license_probe_factory,
             broker_probe=fake_broker_probe,
         )
         answers = await wizard.run()
+
         assert answers.license_key == valid_license()
+        assert answers.alpaca_is_paper is True
+        assert answers.max_trade_allocation_pct == 0.05
+        assert answers.max_portfolio_risk_pct == 0.30
         written = read_env_file(env_file)
         assert written["OKKULTS_LICENSE_KEY"] == valid_license()
-        assert written["EXECUTION_MODE"] == "full_auto"
+        assert written["MAX_TRADE_ALLOCATION_PCT"] == "0.05"
+        assert written["MAX_PORTFOLIO_RISK_PCT"] == "0.3"
         assert written["ALPACA_IS_PAPER"] == "true"
-        assert written.get("PER_TRADE_NOTIONAL_CAP") not in ("", "None")
+        assert written["LIVE_TRADING_ACK"] == "NO"
+        assert written["ALLOW_SHORT_SELLING"] == "false"
+        assert "DISASTER_STOP_PCT" not in written
         mode = stat.S_IMODE(os.stat(env_file).st_mode)
         assert mode == 0o600
 
-    async def test_failed_broker_probe_would_not_arm_but_env_persists(
-        self, tmp_path
-    ) -> None:
-        env_file = tmp_path / ".env"
-
-        async def failing_probe() -> str:
-            return "FAIL — Alpaca rejected the credentials"
-
-        wizard = OnboardingWizard(
-            prompter=ScriptedPrompter(quick_answers()),
-            env_path=str(env_file),
-            license_probe_factory=fake_license_probe_factory,
-            broker_probe=failing_probe,
+        # Paper/live decision comes first, and risk is decided before the
+        # Okkults key is requested.
+        assert "Trading mode" in prompter.questions[0]
+        trade_i = next(
+            i for i, q in enumerate(prompter.questions) if "Max risk per trade" in q
         )
-        answers = await wizard.run()
-        # OpenClaw rule: verification failure never silently "succeeds"
-        # (env is still written here, but health_check returned False -> the
-        # terminal refuses to arm, see main.resolve_config + preflight)
-        assert answers.license_key == valid_license()
+        license_i = next(
+            i for i, q in enumerate(prompter.questions) if "License key" in q
+        )
+        assert trade_i < license_i
 
-    async def test_custom_lane_oversized_allocation_gets_capped(self, tmp_path) -> None:
-        answers_script = [
-            valid_license(),
-            "alpaca",
-            "PK1",
-            "SK1",
-            "paper",
-            "semi_auto",
-            "custom",     # risk profile -> walks every knob
-            "0.40",       # portfolio
-            "0.25",       # per-ticker -> triggers warning
-            "n",          # decline override
-            "0",
-            "0",
-            "0.07",
-            "true",
-        ]
+    async def test_reonboard_removes_legacy_stop_key(self, tmp_path) -> None:
+        env_file = tmp_path / ".env"
+        write_env_file({"DISASTER_STOP_PCT": "0.07"}, env_file)
         wizard = OnboardingWizard(
-            prompter=ScriptedPrompter(answers_script),
-            env_path=str(tmp_path / ".env"),
+            prompter=ScriptedPrompter(paper_answers()),
+            env_path=str(env_file),
             license_probe_factory=fake_license_probe_factory,
             broker_probe=fake_broker_probe,
         )
         await wizard.run()
-        assert wizard.answers.max_trade_allocation_pct == 0.10
+        assert "DISASTER_STOP_PCT" not in read_env_file(env_file)
 
-    async def test_live_endpoint_requires_typed_ack(self, tmp_path) -> None:
+    async def test_live_requires_typed_ack(self, tmp_path) -> None:
         script = [
-            valid_license(),
-            "alpaca",
-            "PK1",
-            "SK1",
             "live",
-            "nope",       # WRONG acknowledgment -> falls back to paper
-            "full_auto",
-            "standard",
-            "true",
+            "nope",           # wrong acknowledgment -> falls back to paper
+            "PK1", "SK1", "5", "30", "false", valid_license(),
+            "full_auto", "true",
         ]
         wizard = OnboardingWizard(
             prompter=ScriptedPrompter(script),
@@ -218,25 +209,77 @@ class TestWizard:
         await wizard.run()
         assert wizard.answers.alpaca_is_paper is True
 
-
-# --------------------------------------------------------------------- #
-# risk profiles (install-time custom profile selection)
-# --------------------------------------------------------------------- #
-class TestRiskProfiles:
-    def profile_script(self, profile_answer: str, extra: list[str]) -> list[str]:
-        """Shared pre-profile script; the profile answer tail is caller-built."""
-        return [
-            valid_license(),
-            "alpaca",
-            "PK1",
-            "SK1",
-            "paper",
-            "full_auto",
-            profile_answer,
-            *extra,
+    async def test_live_ack_saves_live_env(self, tmp_path) -> None:
+        script = [
+            "live",
+            "I UNDERSTAND",
+            "PK1", "SK1", "5", "30", "false", valid_license(),
+            "full_auto", "true",
         ]
+        env_file = tmp_path / ".env"
+        wizard = OnboardingWizard(
+            prompter=ScriptedPrompter(script),
+            env_path=str(env_file),
+            license_probe_factory=fake_license_probe_factory,
+            broker_probe=fake_broker_probe,
+        )
+        await wizard.run()
+        assert wizard.answers.alpaca_is_paper is False
+        assert read_env_file(env_file)["LIVE_TRADING_ACK"] == "YES"
+        # The written config must re-load cleanly (live safety gate passes).
+        loaded = load_settings(_env_file=str(env_file))
+        assert loaded.ALPACA_IS_PAPER is False
 
-    async def _run(self, tmp_path, script) -> OnboardingWizard:
+    async def test_broker_failure_does_not_write(self, tmp_path) -> None:
+        env_file = tmp_path / ".env"
+
+        async def failing_probe(api_key: str, secret_key: str, paper: bool) -> str:
+            del api_key, secret_key, paper
+            return "FAIL — Alpaca rejected the credentials"
+
+        script = ["paper", "PK1", "SK1", "n"]
+        wizard = OnboardingWizard(
+            prompter=ScriptedPrompter(script),
+            env_path=str(env_file),
+            license_probe_factory=fake_license_probe_factory,
+            broker_probe=failing_probe,
+        )
+        with pytest.raises(SystemExit):
+            await wizard.run()
+        assert not Path(env_file).exists()
+
+    async def test_broker_failure_can_retry(self, tmp_path) -> None:
+        env_file = tmp_path / ".env"
+        calls = {"n": 0}
+
+        async def flaky_probe(api_key: str, secret_key: str, paper: bool) -> str:
+            del api_key, secret_key, paper
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "FAIL — Alpaca rejected the credentials"
+            return "OK — connected"
+
+        script = [
+            "paper", "PK1", "SK1", "y", "PK2", "SK2",
+            "5", "30", "false", valid_license(), "full_auto", "true",
+        ]
+        wizard = OnboardingWizard(
+            prompter=ScriptedPrompter(script),
+            env_path=str(env_file),
+            license_probe_factory=fake_license_probe_factory,
+            broker_probe=flaky_probe,
+        )
+        await wizard.run()
+        assert calls["n"] >= 2  # retried, then health-checked again
+        assert read_env_file(env_file)["ALPACA_API_KEY"] == "PK2"
+
+    async def test_risk_caps_reask_instead_of_accepting_oversize(self, tmp_path) -> None:
+        script = [
+            "paper", "PK1", "SK1",
+            "15", "5",       # per-trade 15% rejected, then 5%
+            "40", "30",      # portfolio 40% rejected, then 30%
+            "false", valid_license(), "full_auto", "true",
+        ]
         wizard = OnboardingWizard(
             prompter=ScriptedPrompter(script),
             env_path=str(tmp_path / ".env"),
@@ -244,93 +287,97 @@ class TestRiskProfiles:
             broker_probe=fake_broker_probe,
         )
         await wizard.run()
-        return wizard
+        assert wizard.answers.max_trade_allocation_pct == 0.05
+        assert wizard.answers.max_portfolio_risk_pct == 0.30
 
-    async def test_conservative_profile_caps(self, tmp_path) -> None:
-        from core.onboarding import RISK_PROFILES
-
-        wizard = await self._run(
-            tmp_path, self.profile_script("conservative", ["true"])
+    async def test_risk_fraction_is_rejected(self, tmp_path) -> None:
+        script = [
+            "paper", "PK1", "SK1",
+            "0.05", "5",     # fraction rejected, then 5%
+            "30", "false", valid_license(), "full_auto", "true",
+        ]
+        wizard = OnboardingWizard(
+            prompter=ScriptedPrompter(script),
+            env_path=str(tmp_path / ".env"),
+            license_probe_factory=fake_license_probe_factory,
+            broker_probe=fake_broker_probe,
         )
-        assert wizard.answers.risk_profile == "conservative"
-        assert wizard.answers.max_trade_allocation_pct == RISK_PROFILES["conservative"]["max_trade_allocation_pct"] == 0.05
-        assert wizard.answers.max_portfolio_risk_pct == 0.20
-        assert wizard.answers.disaster_stop_pct == 0.05
-        written = read_env_file(tmp_path / ".env")
-        assert written["MAX_TRADE_ALLOCATION_PCT"] == "0.05"
+        await wizard.run()
+        assert wizard.answers.max_trade_allocation_pct == 0.05
 
-    async def test_standard_is_default_profile(self, tmp_path) -> None:
-        wizard = await self._run(tmp_path, self.profile_script("", ["true"]))
-        assert wizard.answers.risk_profile == "standard"
-        assert wizard.answers.max_trade_allocation_pct == 0.10
-
-    async def test_aggressive_declining_override_falls_back_to_standard(
-        self, tmp_path
-    ) -> None:
-        wizard = await self._run(
-            tmp_path, self.profile_script("aggressive", ["n", "true"])
+    async def test_portfolio_below_trade_is_rejected(self, tmp_path) -> None:
+        script = [
+            "paper", "PK1", "SK1",
+            "10", "5", "30",  # 5% portfolio < 10% trade -> re-ask 30%
+            "false", valid_license(), "full_auto", "true",
+        ]
+        wizard = OnboardingWizard(
+            prompter=ScriptedPrompter(script),
+            env_path=str(tmp_path / ".env"),
+            license_probe_factory=fake_license_probe_factory,
+            broker_probe=fake_broker_probe,
         )
-        assert wizard.answers.risk_profile == "standard"
+        await wizard.run()
         assert wizard.answers.max_trade_allocation_pct == 0.10
         assert wizard.answers.max_portfolio_risk_pct == 0.30
 
-    async def test_aggressive_confirmed_override_keeps_aggressive(
-        self, tmp_path
-    ) -> None:
-        wizard = await self._run(
-            tmp_path, self.profile_script("aggressive", ["y", "true"])
-        )
-        assert wizard.answers.risk_profile == "aggressive"
-        assert wizard.answers.max_trade_allocation_pct == 0.15
-        assert wizard.answers.max_portfolio_risk_pct == 0.40
-        written = read_env_file(tmp_path / ".env")
-        assert written["MAX_PORTFOLIO_RISK_PCT"] == "0.4"
+    async def test_rejected_license_reasks(self, tmp_path) -> None:
+        def rejecting_factory(key: str):
+            async def probe() -> str | None:
+                if "bad" in key:
+                    return "signal server rejected the license (InvalidStatus)"
+                return None
 
-    async def test_custom_profile_walks_every_knob(self, tmp_path) -> None:
+            return probe
+
+        good = "ok_paper_" + "G" * 30
+        bad = "ok_paper_bad"
         script = [
-            valid_license(),
-            "alpaca",
-            "PK1",
-            "SK1",
-            "paper",
-            "full_auto",
-            "custom",       # profile
-            "0.25",         # portfolio
-            "0.06",         # per-ticker
-            "5000",         # notional cap
-            "1000",         # cash reserve
-            "0.08",         # disaster stop
-            "false",        # failsafe
+            "paper", "PK1", "SK1", "5", "30", "false",
+            bad, good, "full_auto", "true",
         ]
-        wizard = await self._run(tmp_path, script)
-        assert wizard.answers.risk_profile == "custom"
-        assert wizard.answers.max_trade_allocation_pct == 0.06
-        assert wizard.answers.per_trade_notional_cap == 5000.0
-        assert wizard.answers.cash_reserve == 1000.0
-        assert wizard.answers.disaster_stop_pct == 0.08
-        assert wizard.answers.local_exit_failsafe is False
-        written = read_env_file(tmp_path / ".env")
-        assert written["PER_TRADE_NOTIONAL_CAP"] == "5000.0"
-        assert written["LOCAL_EXIT_FAILSAFE"] == "false"
+        wizard = OnboardingWizard(
+            prompter=ScriptedPrompter(script),
+            env_path=str(tmp_path / ".env"),
+            license_probe_factory=rejecting_factory,
+            broker_probe=fake_broker_probe,
+        )
+        await wizard.run()
+        assert wizard.answers.license_key == good
 
 
-# --------------------------------------------------------------------- #
-# config routing
-# --------------------------------------------------------------------- #
+class TestRiskProfilesInSettings:
+    def test_settings_enforce_hard_caps(self) -> None:
+        with pytest.raises(ValueError):
+            Settings(MAX_TRADE_ALLOCATION_PCT=0.15)
+        with pytest.raises(ValueError):
+            Settings(MAX_PORTFOLIO_RISK_PCT=0.31)
+
+    def test_live_requires_acknowledgment(self) -> None:
+        with pytest.raises(ValueError):
+            Settings(ALPACA_IS_PAPER=False, LIVE_TRADING_ACK="NO")
+        settings = Settings(ALPACA_IS_PAPER=False, LIVE_TRADING_ACK="YES")
+        assert settings.ALPACA_IS_PAPER is False
+
+    def test_defaults_are_conservative(self) -> None:
+        settings = Settings()
+        assert settings.MAX_TRADE_ALLOCATION_PCT == 0.05
+        assert settings.MAX_PORTFOLIO_RISK_PCT == 0.30
+        assert settings.ALLOW_SHORT_SELLING is False
+
+
 class TestConfigRouting:
     def test_missing_fields_route_to_wizard(self, monkeypatch, tmp_path) -> None:
         monkeypatch.chdir(tmp_path)
-        from config.settings import Settings
-
-        settings = Settings(OKKULTS_LICENSE_KEY="", ALPACA_API_KEY="", ALPACA_SECRET_KEY="")
+        settings = Settings(
+            OKKULTS_LICENSE_KEY="", ALPACA_API_KEY="", ALPACA_SECRET_KEY=""
+        )
         assert set(missing_required_fields(settings)) == {
             "OKKULTS_LICENSE_KEY", "ALPACA_API_KEY", "ALPACA_SECRET_KEY"
         }
 
     def test_complete_config_is_runnable(self, monkeypatch, tmp_path) -> None:
         monkeypatch.chdir(tmp_path)
-        from config.settings import Settings
-
         settings = Settings(
             OKKULTS_LICENSE_KEY=valid_license(),
             ALPACA_API_KEY="PK",

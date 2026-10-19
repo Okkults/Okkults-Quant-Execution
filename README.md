@@ -6,12 +6,12 @@
 
 # Okkults Quant Terminal
 
-**Automated pre-earnings execution client.** Listens for the 3:50 PM EST
+**Automated pre-earnings execution client.** Listens for the 3:50 PM ET
 signal from your Okkults account, sizes the 6-12 ticker basket against your
-live equity, fires all orders concurrently, rests payload-driven disaster
-stops server-side, and liquidates everything into the 9:30:15 AM opening
-cross. Open-source and non-custodial: it executes on **your** broker, with
-**your** keys, on **your** machine.
+live equity, fires all orders concurrently, and liquidates only the positions
+it opened into the 9:30:15 AM opening cross. No resting stops are placed.
+Open-source and non-custodial: it executes on **your** broker, with **your**
+keys, on **your** machine.
 
 ## Quickstart (local)
 
@@ -21,19 +21,23 @@ pip install -r requirements.txt
 python main.py
 ```
 
-No config file needed — the terminal onboarding wizard (OpenClaw-style)
-launches, walks you through:
+No config file needed — the terminal onboarding wizard launches and walks
+you through, in this order:
 
 1. **Security notice** — the non-custodial architecture, up front
-2. **Okkults license** — masked entry, live-probed against the signal server
-3. **Broker** — Alpaca (IBKR coming in Phase 2)
-4. **Alpaca keys** — paper by default; live requires typing `I UNDERSTAND`
-5. **Execution mode** — `full_auto` (fires on signal) or `semi_auto` (you press Enter)
-6. **Risk caps** — with a bold-red risk-parity warning above 10%/ticker
+2. **Paper or live** — paper is the default; live requires typing `I UNDERSTAND`
+3. **Alpaca API key + secret** — verified against Alpaca before anything is saved
+4. **Risk per trade + max total risk at one time** — default 5% / 30%, with
+   hard caps of 10% / 30%; oversized values are rejected, not silently accepted
+5. **Okkults API key** — masked entry, live-probed against the signal server
+6. **Execution mode** — `full_auto` (fires on signal) or `semi_auto` (you press
+   Enter; requires an interactive TTY) and the local failsafe toggle
 7. **Health check** — real equity fetch, then **SYSTEM ARMED**
 
 Everything lands in a `chmod 600 .env` written atomically. Re-runs skip the
-wizard when config is valid; `--onboard` forces it again.
+wizard when config is valid; `--onboard` forces it again. The client never
+places resting stop orders, and it tracks only positions it opens itself —
+pre-existing broker holdings are never touched.
 
 ### Prove it first — zero credentials
 
@@ -42,8 +46,8 @@ python main.py --mock
 ```
 
 Simulates the complete cycle with a fake $50,000 account: 12-ticker batch →
-concurrent fire (<200 ms) → server-side disaster stops → 9:30 open-cross exit →
-PnL table.
+concurrent fire (<200 ms) → no resting stops → 9:30 open-cross exit → PnL
+table.
 
 ### Flags
 
@@ -62,7 +66,7 @@ docker run -d --restart=always --name okkults-executor \
   okkults/execution-client:latest
 ```
 
-Heads-less containers run `full_auto` 24/7 in US-East (~$3/month on Railway
+Headless containers run `full_auto` 24/7 in US-East (~$3/month on Railway
 or Render — cheaper than an idle laptop missing the entry window).
 
 ## How Okkults Executes
@@ -81,31 +85,36 @@ or Render — cheaper than an idle laptop missing the entry window).
   logged, echoed, or shipped in telemetry.
 - **Open source — verify the code.** No backdoors, no key-stealing scripts.
   Grep it yourself: there are zero indicator formulas (ATR, RSI, MACD…) in
-  this repo. All sizing and exit numbers ride in the wire payload from the
-  Okkults server — this "Dumb Runner" is math-blind by design.
+  this repo. Prices and exit instructions ride in the wire payload from the
+  Okkults server; local code only applies your risk caps — this "Dumb Runner"
+  is math-blind by design.
 
 ## The three quant rules baked into the design
 
-1. **Sizing IS the stop-loss.** 3-5-10% allocations, hard portfolio ceiling —
-   a single -20% earnings gap costs at most a fraction of a percent of equity.
-   A resting stop cannot protect against a gap; allocation caps can.
+1. **Sizing IS the stop-loss.** 5% default per ticker, 10% hard cap, 30%
+   total exposure ceiling — a single -20% earnings gap costs at most a small
+   fraction of equity. A resting stop cannot protect against a gap; allocation
+   caps can, so this client places no resting stops.
 2. **Law of large numbers.** 6-12 uncorrelated reports per evening; the
    winners' basket overruns the single disaster name.
 3. **Exit at the official 9:30 open cross.** Fairest spreads, deepest
    liquidity — no panic after-hours dumps. A `LOCAL_EXIT_FAILSAFE`
-   liquidates locally at 9:30:16 AM if the signal server ever goes dark.
+   liquidates client-opened positions locally at 9:30:16 AM if the signal
+   server ever goes dark.
 
 ## Risk configuration defaults
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `MAX_PORTFOLIO_RISK_PCT` | 0.30 | total exposure ceiling across the batch |
-| `MAX_TRADE_ALLOCATION_PCT` | 0.10 | per-ticker target (auto-downscaled if needed) |
+| `MAX_PORTFOLIO_RISK_PCT` | 0.30 | total exposure at one time (hard cap 0.30) |
+| `MAX_TRADE_ALLOCATION_PCT` | 0.05 | per-ticker target (hard cap 0.10, auto-downscaled) |
 | `PER_TRADE_NOTIONAL_CAP` | blank | optional USD cap per order |
 | `CASH_RESERVE` | 0.0 | dollars held out of sizing |
-| `DISASTER_STOP_PCT` | 0.07 | payload-overridable emergency stop |
+| `ALLOW_SHORT_SELLING` | false | SELL signals open shorts only when enabled |
 | `ALPACA_IS_PAPER` | true | paper until you explicitly go live |
-| `EXECUTION_MODE` | full_auto | `semi_auto` adds the Enter-key gate |
+| `LIVE_TRADING_ACK` | NO | must be `YES` when `ALPACA_IS_PAPER=false` |
+| `EXECUTION_MODE` | full_auto | `semi_auto` adds the Enter-key gate (TTY only) |
+| `LOCAL_EXIT_FAILSAFE` | true | liquidate client-opened positions at 9:30:16 if needed |
 
 ## Architecture
 
@@ -124,8 +133,8 @@ signals/listener.py ── core/executor.py ── core/risk.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q            # 53 tests: sizing parity, protocol, executor, wizard
-mypy core brokers config signals main.py
+pytest -q            # 71 tests: sizing parity, protocol, executor, wizard
+mypy .
 ruff check .
 ```
 

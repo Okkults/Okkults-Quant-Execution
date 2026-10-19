@@ -25,7 +25,12 @@ MAX_SIGNALS_PER_BATCH: int = 12
 
 
 class ExitRules(BaseModel):
-    """Exit percentages handed over the wire verbatim. Client never computes."""
+    """Exit hints handed over the wire for contract compatibility.
+
+    The client does not place resting stops, so ``disaster_stop_pct`` is
+    parsed but intentionally unused. All actual exits come from the server's
+    EXIT_SIGNAL / CLOSE_POSITION messages plus the local failsafe.
+    """
 
     disaster_stop_pct: float
     profit_target_pct: float | None = None

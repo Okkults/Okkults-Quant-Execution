@@ -1,20 +1,22 @@
 """Onboarding wizard — OpenClaw-style guided terminal setup.
 
-Design mirrors OpenClaw's ``onboard`` flow:
+Flow (exactly the order an operator needs to make the safety decision):
 
-* route by config state (missing/broken -> wizard; valid -> run)
-* security notice before gathering any secret
-* **verify live before persisting** — a failed check never writes
-* masked secret entry; secrets never re-echoed to the screen
-* atomic ``.env`` write with 0600 permissions
-* health-check summary at the end, then the terminal arms itself
+1. security notice (non-custodial architecture, up front)
+2. **paper or live** — live requires typing ``I UNDERSTAND``
+3. Alpaca API key + secret — verified live before anything is persisted
+4. risk per trade and max total risk at one time — hard-capped at 10%/30%
+5. Okkults license key — masked entry, probed against the signal server
+6. execution mode (``full_auto`` / ``semi_auto``) and the local failsafe
 
-All interactive I/O flows through the :class:`Prompter` protocol so tests
-can drive a scripted fake prompter.
+The wizard never writes a config until the broker credentials have passed a
+real connection probe. Secrets are never echoed, and the ``.env`` write is
+atomic with 0600 permissions.
 """
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -24,11 +26,14 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 
+from config.settings import (
+    DEFAULT_TRADE_PCT,
+    HARD_MAX_PORTFOLIO_PCT,
+    HARD_MAX_TRADE_PCT,
+)
 from core.envwriter import mask_secret, merge_env_updates, read_env_file, write_env_file
 
 __all__ = [
-    "PROFILE_ORDER",
-    "RISK_PROFILES",
     "ConsolePrompter",
     "OnboardingWizard",
     "Prompter",
@@ -36,6 +41,8 @@ __all__ = [
     "allocation_warning",
     "alpaca_key_error",
     "license_error",
+    "probe_broker_credentials",
+    "risk_pct_error",
     "verify_license_probe",
 ]
 
@@ -43,29 +50,7 @@ console = Console()
 
 LICENSE_PREFIXES = ("ok_live_", "ok_paper_")
 LIVE_ACK_WORDS = "I UNDERSTAND"
-MAX_ALLOCATION_PCT_WARN = 0.10
 DEFAULT_WS_URL = "wss://okkults-api.okkults.workers.dev/v1/stream"
-
-# Install-time risk profiles. Level maps to concrete caps; `custom` walks
-# every knob individually. Standard matches the website dashboard defaults.
-RISK_PROFILES: dict[str, dict[str, float]] = {
-    "conservative": {
-        "max_portfolio_risk_pct": 0.20,
-        "max_trade_allocation_pct": 0.05,
-        "disaster_stop_pct": 0.05,
-    },
-    "standard": {
-        "max_portfolio_risk_pct": 0.30,
-        "max_trade_allocation_pct": 0.10,
-        "disaster_stop_pct": 0.07,
-    },
-    "aggressive": {
-        "max_portfolio_risk_pct": 0.40,
-        "max_trade_allocation_pct": 0.15,
-        "disaster_stop_pct": 0.10,
-    },
-}
-PROFILE_ORDER = ["conservative", "standard", "aggressive", "custom"]
 
 
 def verify_license_probe(
@@ -162,11 +147,30 @@ def license_error(key: str) -> str | None:
 
 def allocation_warning(value: float) -> str:
     return (
-        f"[bold red][!] WARNING: Sizing above {MAX_ALLOCATION_PCT_WARN * 100:.0f}% per "
+        f"[bold red][!] WARNING: Sizing above {HARD_MAX_TRADE_PCT * 100:.0f}% per "
         "ticker on earnings plays violates statistical risk parity.[/bold red]"
         f"[red] You requested {value * 100:.1f}%. A -20% gap on one report would cost "
-        f"~{value * 20:.1f}% of total equity. Recommended ceiling: 5-10%.[/red]"
+        f"~{value * 20:.1f}% of total equity. Recommended ceiling: 5-10%, and the "
+        "client enforces a hard 10% cap.[/red]"
     )
+
+
+def risk_pct_error(
+    label: str,
+    value: float,
+    *,
+    maximum: float,
+    minimum: float = 0.0,
+) -> str | None:
+    """Human-readable validation for the two onboarding risk questions."""
+    if value <= minimum:
+        return f"{label} must be greater than {minimum * 100:.0f}%"
+    if value > maximum:
+        return (
+            f"{label} cannot exceed {maximum * 100:.0f}% — this is a hard "
+            "risk ceiling and cannot be overridden."
+        )
+    return None
 
 
 def alpaca_key_error(key_id: str, secret_key: str) -> str | None:
@@ -185,22 +189,21 @@ class WizardAnswers:
     alpaca_secret_key: str = ""
     alpaca_is_paper: bool = True
     execution_mode: str = "full_auto"
-    risk_profile: str = "standard"
-    max_portfolio_risk_pct: float = 0.30
-    max_trade_allocation_pct: float = 0.10
+    max_trade_allocation_pct: float = DEFAULT_TRADE_PCT
+    max_portfolio_risk_pct: float = HARD_MAX_PORTFOLIO_PCT
     per_trade_notional_cap: float | None = None
     cash_reserve: float = 0.0
-    disaster_stop_pct: float = 0.07
+    allow_short_selling: bool = False
     local_exit_failsafe: bool = True
     probes: dict[str, str] = field(default_factory=dict)
 
 
 LicenseProbeFactory = Callable[[str], Callable[[], Awaitable[str | None]]]
-BrokerProbe = Callable[[], Awaitable[str]]
+BrokerProbe = Callable[[str, str, bool], Awaitable[str]]
 
 
 class OnboardingWizard:
-    """Guided setup: security notice -> creds -> live verify -> persist."""
+    """Guided setup: security notice -> mode -> credentials -> risk -> license."""
 
     def __init__(
         self,
@@ -226,15 +229,22 @@ class OnboardingWizard:
         self.security_notice()
         try:
             current = read_env_file(self._env_path)
+            await self._trading_mode_lane(current)
+            await self._credentials_lane(current)
+            await self._risk_lane(current)
             await self._license_lane(current)
-            await self._broker_lane()
-            await self._credentials_lane()
-            await self._execution_lane()
-            await self._risk_lane()
+            await self._execution_lane(current)
+            self.answers.local_exit_failsafe = self._prompt.confirm(
+                "LOCAL_EXIT_FAILSAFE — auto-liquidate client-opened positions "
+                "at 9:30:16 AM ET if the server's EXIT_SIGNAL never arrives?",
+                default=self._env_bool(
+                    current, "LOCAL_EXIT_FAILSAFE", self.answers.local_exit_failsafe
+                ),
+            )
         except EOFError:
             console.print(
-                "[yellow][!] Input stream closed (EOF) — setup paused after "
-                "no changes were committed. Re-run `python main.py` to resume "
+                "[yellow][!] Input stream closed (EOF) — setup paused before "
+                "any changes were committed. Re-run `python main.py` to resume "
                 "and complete the wizard.[/yellow]"
             )
             raise SystemExit(1) from None
@@ -245,8 +255,155 @@ class OnboardingWizard:
     # ------------------------------------------------------------------ #
     # lanes
     # ------------------------------------------------------------------ #
+    async def _trading_mode_lane(self, current: dict[str, str]) -> None:
+        console.print(Rule("[bold]Step 1 — Paper or live"))
+        default = "paper" if self._env_bool(current, "ALPACA_IS_PAPER", True) else "live"
+        mode = self._prompt.choice(
+            "Trading mode", ["paper", "live"], default=default
+        )
+        if mode == "live":
+            ack = self._prompt.text(
+                f"Type '{LIVE_ACK_WORDS}' to acknowledge real-money risk"
+            )
+            if ack != LIVE_ACK_WORDS:
+                console.print(
+                    "[yellow]Confirmation text mismatch — staying on PAPER[/yellow]"
+                )
+                mode = "paper"
+        self.answers.alpaca_is_paper = mode == "paper"
+        console.print(
+            "[bold red]LIVE trading enabled — real money. Hard risk caps still "
+            "apply; no resting stops will be placed.[/bold red]\n"
+            if mode == "live"
+            else "[green]PAPER endpoint selected (safe default).[/green]"
+        )
+
+    async def _credentials_lane(self, current: dict[str, str]) -> None:
+        console.print(Rule("[bold]Step 2 — Alpaca credentials"))
+        existing_key = current.get("ALPACA_API_KEY", "")
+        existing_secret = current.get("ALPACA_SECRET_KEY", "")
+        key_extra = f" [current {mask_secret(existing_key)}]" if existing_key else ""
+        while True:
+            key_id = self._prompt.secret(
+                f"Alpaca API key id (PK…){key_extra}, Enter keeps current"
+            )
+            secret = self._prompt.secret(
+                "Alpaca secret key (Enter keeps current)"
+            )
+            key_id = key_id or existing_key
+            secret = secret or existing_secret
+            problem = alpaca_key_error(key_id, secret)
+            if problem:
+                console.print(f"[bold red]✗ {problem}[/bold red]")
+                continue
+
+            console.print("[dim]Verifying credentials against Alpaca…[/dim]")
+            verdict = await self._run_broker_probe(
+                key_id, secret, self.answers.alpaca_is_paper
+            )
+            if verdict.startswith("OK"):
+                self.answers.alpaca_api_key = key_id
+                self.answers.alpaca_secret_key = secret
+                self.answers.probes["broker"] = verdict
+                console.print(f"[green][OK][/green] {verdict}")
+                return
+
+            console.print(f"[bold red]✗ {verdict}[/bold red]")
+            if not self._prompt.confirm(
+                "Retry Alpaca credentials?", default=True
+            ):
+                console.print(
+                    "[bold red]Cannot arm without valid Alpaca credentials. "
+                    "Nothing was saved.[/bold red]"
+                )
+                raise SystemExit(1)
+
+    async def _risk_lane(self, current: dict[str, str]) -> None:
+        console.print(Rule("[bold]Step 3 — Risk limits"))
+        default_trade = min(
+            max(
+                self._current_float(
+                    current, "MAX_TRADE_ALLOCATION_PCT", DEFAULT_TRADE_PCT
+                ),
+                0.01,
+            ),
+            HARD_MAX_TRADE_PCT,
+        )
+        while True:
+            raw_trade = self._prompt.float(
+                "Max risk per trade (% of equity, e.g. 5; hard cap 10)",
+                default=default_trade * 100,
+            )
+            trade_pct = raw_trade / 100.0
+            if raw_trade < 1:
+                console.print(
+                    "[bold red]✗ Enter a percentage such as 5, not a fraction.[/bold red]"
+                )
+                continue
+            problem = risk_pct_error(
+                "Max risk per trade",
+                trade_pct,
+                maximum=HARD_MAX_TRADE_PCT,
+            )
+            if problem:
+                console.print(f"[bold red]✗ {problem}[/bold red]")
+                continue
+            break
+
+        default_portfolio = min(
+            max(
+                self._current_float(
+                    current, "MAX_PORTFOLIO_RISK_PCT", HARD_MAX_PORTFOLIO_PCT
+                ),
+                0.01,
+            ),
+            HARD_MAX_PORTFOLIO_PCT,
+        )
+        while True:
+            raw_portfolio = self._prompt.float(
+                "Max total risk at one time (% of equity, e.g. 30; hard cap 30)",
+                default=default_portfolio * 100,
+            )
+            portfolio_pct = raw_portfolio / 100.0
+            if raw_portfolio < 1:
+                console.print(
+                    "[bold red]✗ Enter a percentage such as 30, not a fraction.[/bold red]"
+                )
+                continue
+            problem = risk_pct_error(
+                "Max total risk at one time",
+                portfolio_pct,
+                maximum=HARD_MAX_PORTFOLIO_PCT,
+            )
+            if problem:
+                console.print(f"[bold red]✗ {problem}[/bold red]")
+                continue
+            if portfolio_pct < trade_pct:
+                console.print(
+                    "[bold red]✗ Max total risk must be at least the per-trade "
+                    "risk.[/bold red]"
+                )
+                continue
+            break
+
+        self.answers.max_trade_allocation_pct = trade_pct
+        self.answers.max_portfolio_risk_pct = portfolio_pct
+        self.answers.per_trade_notional_cap = self._current_optional_float(
+            current, "PER_TRADE_NOTIONAL_CAP"
+        )
+        self.answers.cash_reserve = self._current_float(
+            current, "CASH_RESERVE", 0.0
+        )
+        self.answers.allow_short_selling = self._prompt.confirm(
+            "Allow SELL signals to open short positions? (default off)",
+            default=self._env_bool(
+                current, "ALLOW_SHORT_SELLING", self.answers.allow_short_selling
+            ),
+        )
+        self._print_risk_summary()
+
     async def _license_lane(self, current: dict[str, str]) -> None:
-        console.print(Rule("[bold]Step 1 — Okkults license"))
+        console.print(Rule("[bold]Step 4 — Okkults API key"))
         existing = current.get("OKKULTS_LICENSE_KEY", "")
         shown = mask_secret(existing)
         extra = "" if existing == "" else f" [current {shown}]"
@@ -265,68 +422,38 @@ class OnboardingWizard:
             console.print("[dim]Probing the signal server…[/dim]")
             verdict = await self._license_probe_factory(raw)()
             if verdict is not None:
+                if "rejected" in verdict:
+                    console.print(f"[bold red]✗ {verdict}[/bold red]")
+                    continue
                 console.print(f"[yellow]{verdict}[/yellow]")
                 if not self._prompt.confirm("Use this license anyway?", default=True):
                     continue
             self.answers.license_key = raw
-            self.answers.probes["license"] = "verified" if verdict is None else "skipped-verify (saved anyway)"
-            return
-
-    async def _broker_lane(self) -> None:
-        console.print(Rule("[bold]Step 2 — Broker"))
-        raw = self._prompt.choice("Broker", ["alpaca", "ibkr"], default="alpaca")
-        if raw == "ibkr":
-            console.print(
-                "[yellow][!] Interactive Brokers (IB Gateway) integration is "
-                "currently in private beta. Coming in Phase 2. Please use Alpaca."
-                "[/yellow]"
-            )
-            await self._broker_lane()
-            return
-        self.answers.broker = raw
-
-    async def _credentials_lane(self) -> None:
-        console.print(Rule("[bold]Step 3 — Alpaca credentials"))
-        while True:
-            key_id = self._prompt.secret("Alpaca API key id (PK…)")
-            secret = self._prompt.secret("Alpaca secret key (…)")
-            problem = alpaca_key_error(key_id, secret)
-            if problem:
-                console.print(f"[bold red]✗ {problem}[/bold red]")
-                continue
-            mode = self._prompt.choice(
-                "Alpaca endpoint", ["paper", "live"], default="paper"
-            )
-            if mode == "live":
-                ack = self._prompt.text(
-                    f"Type '{LIVE_ACK_WORDS}' to acknowledge real-money risk"
-                )
-                if ack != LIVE_ACK_WORDS:
-                    console.print(
-                        "[yellow]Confirmation text mismatch — staying on PAPER[/yellow]"
-                    )
-                    mode = "paper"
-            self.answers.alpaca_api_key = key_id
-            self.answers.alpaca_secret_key = secret
-            self.answers.alpaca_is_paper = mode == "paper"
-            console.print(
-                "[bold red]LIVE trading enabled — caps still enforced.[/bold red]\n"
-                if mode == "live"
-                else "[green]PAPER endpoint selected (safe default).[/green]"
+            self.answers.probes["license"] = (
+                "verified" if verdict is None else "saved (probe failed)"
             )
             return
 
-    async def _execution_lane(self) -> None:
-        console.print(Rule("[bold]Step 4 — Execution mode"))
+    async def _execution_lane(self, current: dict[str, str]) -> None:
+        console.print(Rule("[bold]Step 5 — Execution mode"))
+        default = current.get("EXECUTION_MODE", "full_auto")
+        if default not in ("full_auto", "semi_auto"):
+            default = "full_auto"
         mode = self._prompt.choice(
-            "Execution mode", ["full_auto", "semi_auto"], default="full_auto"
+            "Execution mode", ["full_auto", "semi_auto"], default=default
         )
         if mode == "semi_auto":
             console.print(
                 "[dim]semi_auto: the batch renders, chimes, and waits for your "
-                "Enter/Spacebar before firing; timeout is 90s or 3:58 PM, "
-                "whichever comes first.[/dim]"
+                "Enter/Spacebar before firing; timeout is 90s or the entry "
+                "cutoff, whichever comes first.[/dim]"
             )
+            if not sys.stdin.isatty():
+                console.print(
+                    "[yellow][!] semi_auto requires an interactive TTY; pre-flight "
+                    "will refuse to arm in headless/cloud mode. Use full_auto "
+                    "there.[/yellow]"
+                )
         else:
             console.print(
                 "[dim]full_auto: orders fire the moment the WebSocket signal "
@@ -334,109 +461,33 @@ class OnboardingWizard:
             )
         self.answers.execution_mode = mode
 
-    async def _risk_lane(self) -> None:
-        """Risk profile chooser + custom knob walk + failsafe toggle."""
-        console.print(Rule("[bold]Step 5 — Risk profile"))
-        profile = self._prompt.choice(
-            "Risk profile (per-trade sizing vs max risk budget)",
-            PROFILE_ORDER,
-            default="standard",
-        )
-        if profile != "custom":
-            mapped = RISK_PROFILES[profile]
-            self.answers.risk_profile = profile
-            self.answers.max_portfolio_risk_pct = mapped["max_portfolio_risk_pct"]
-            self.answers.max_trade_allocation_pct = mapped["max_trade_allocation_pct"]
-            self.answers.disaster_stop_pct = mapped["disaster_stop_pct"]
-            if profile == "aggressive":
-                console.print(
-                    allocation_warning(self.answers.max_trade_allocation_pct)
-                )
-                if not self._prompt.confirm(
-                    "Override the risk-parity ceiling anyway?", default=False
-                ):
-                    fallback = RISK_PROFILES["standard"]
-                    self.answers.risk_profile = "standard"
-                    self.answers.max_portfolio_risk_pct = fallback["max_portfolio_risk_pct"]
-                    self.answers.max_trade_allocation_pct = fallback["max_trade_allocation_pct"]
-                    self.answers.disaster_stop_pct = fallback["disaster_stop_pct"]
-                    console.print(
-                        "[green]Kept STANDARD caps: 10% per ticker / 30% batch ceiling.[/green]"
-                    )
-        else:
-            self.answers.risk_profile = "custom"
-            await self._custom_risk_knobs()
-
-        self.answers.local_exit_failsafe = self._prompt.confirm(
-            "LOCAL_EXIT_FAILSAFE — auto-liquidate at 9:30:16 AM ET if the "
-            "server's EXIT_SIGNAL never arrives?",
-            default=True,
-        )
-        self._print_profile_summary()
-
-    async def _custom_risk_knobs(self) -> None:
-        """Custom profile: every risk knob walked individually."""
-        portfolio = self._prompt.float(
-            "MAX_PORTFOLIO_RISK_PCT (total exposure ceiling, e.g. 0.30)",
-            self.answers.max_portfolio_risk_pct,
-        )
-        per_ticker = self._prompt.float(
-            "MAX_TRADE_ALLOCATION_PCT (per-ticker target, e.g. 0.10)",
-            self.answers.max_trade_allocation_pct,
-        )
-        if per_ticker > MAX_ALLOCATION_PCT_WARN:
-            console.print(allocation_warning(per_ticker))
-            if not self._prompt.confirm(
-                "Override the risk-parity ceiling anyway?", default=False
-            ):
-                per_ticker = MAX_ALLOCATION_PCT_WARN
-                console.print(
-                    f"[green]Kept safe ceiling: {MAX_ALLOCATION_PCT_WARN * 100:.0f}% per ticker.[/green]"
-                )
-        cap = self._prompt.float(
-            "PER_TRADE_NOTIONAL_CAP USD (0 = none)",
-            self.answers.per_trade_notional_cap or 0.0,
-        )
-        reserve = self._prompt.float(
-            "CASH_RESERVE USD held out of sizing", self.answers.cash_reserve
-        )
-        stop_pct = self._prompt.float(
-            "DISASTER_STOP_PCT (default stop; server may override per signal)",
-            self.answers.disaster_stop_pct,
-        )
-        self.answers.max_portfolio_risk_pct = max(0.0, portfolio)
-        self.answers.max_trade_allocation_pct = max(0.0, per_ticker)
-        self.answers.per_trade_notional_cap = cap if cap > 0 else None
-        self.answers.cash_reserve = max(0.0, reserve)
-        self.answers.disaster_stop_pct = min(max(0.0, stop_pct), 0.5)
-
-    def _print_profile_summary(self) -> None:
-        """Show the chosen caps as an institutional summary card."""
+    def _print_risk_summary(self) -> None:
         a = self.answers
-        table = Table(title=f"Risk profile — {a.risk_profile}", header_style="bold magenta")
+        table = Table(
+            title="Risk limits (hard caps enforced)", header_style="bold magenta"
+        )
         table.add_column("Knob", style="bold")
         table.add_column("Value", justify="right")
         table.add_row(
-            "Max risk per trade (per ticker)",
-            f"{a.max_trade_allocation_pct * 100:.0f}%",
+            "Max risk per trade",
+            f"{a.max_trade_allocation_pct * 100:.1f}%",
         )
         table.add_row(
-            "Max batch risk (portfolio ceiling)",
-            f"{a.max_portfolio_risk_pct * 100:.0f}%",
+            "Max total risk at one time",
+            f"{a.max_portfolio_risk_pct * 100:.1f}%",
         )
-        table.add_row("Disaster stop (defaults; payload may override)", f"{a.disaster_stop_pct * 100:.0f}%")
+        table.add_row(
+            "Short selling", "ENABLED" if a.allow_short_selling else "disabled"
+        )
         if a.per_trade_notional_cap is not None:
             table.add_row("Per-trade notional cap", f"${a.per_trade_notional_cap:,.0f}")
         if a.cash_reserve:
             table.add_row("Cash reserve", f"${a.cash_reserve:,.0f}")
-        table.add_row("Execution mode", a.execution_mode)
-        table.add_row("Local failsafe", "ARMED" if a.local_exit_failsafe else "disabled")
         console.print(table)
-        worst_gap = a.max_trade_allocation_pct * 20
         console.print(
             f"[dim]Worst single-gap math: a -20% overnight gap on one report "
-            f"costs about {worst_gap:.1f}% of equity "
-            f"(sizing {a.max_trade_allocation_pct * 100:.0f}% × gap).[/dim]"
+            f"costs about {a.max_trade_allocation_pct * 20:.1f}% of equity "
+            f"(sizing {a.max_trade_allocation_pct * 100:.1f}% × gap).[/dim]"
         )
 
     # ------------------------------------------------------------------ #
@@ -451,11 +502,12 @@ class OnboardingWizard:
             "ALPACA_API_KEY": a.alpaca_api_key,
             "ALPACA_SECRET_KEY": a.alpaca_secret_key,
             "ALPACA_IS_PAPER": "true" if a.alpaca_is_paper else "false",
+            "LIVE_TRADING_ACK": "YES" if not a.alpaca_is_paper else "NO",
             "EXECUTION_MODE": a.execution_mode,
             "MAX_PORTFOLIO_RISK_PCT": f"{a.max_portfolio_risk_pct}",
             "MAX_TRADE_ALLOCATION_PCT": f"{a.max_trade_allocation_pct}",
             "CASH_RESERVE": f"{a.cash_reserve}",
-            "DISASTER_STOP_PCT": f"{a.disaster_stop_pct}",
+            "ALLOW_SHORT_SELLING": "true" if a.allow_short_selling else "false",
             "LOCAL_EXIT_FAILSAFE": "true" if a.local_exit_failsafe else "false",
         }
         if a.per_trade_notional_cap is not None:
@@ -464,6 +516,8 @@ class OnboardingWizard:
 
     def _persist(self, current: dict[str, str]) -> None:
         merged = merge_env_updates(current, self.env_values())
+        # Legacy knob removed from the client: never carry it forward.
+        merged.pop("DISASTER_STOP_PCT", None)
         write_env_file(merged, self._env_path)
         console.print(
             f"[green][OK][/green] Configuration written to {self._env_path} "
@@ -477,25 +531,32 @@ class OnboardingWizard:
         table.add_column("Result")
         table.add_row(
             "License",
-            f"{mask_secret(self.answers.license_key)} ({self.answers.probes.get('license', 'checked')})",
+            f"{mask_secret(self.answers.license_key)} "
+            f"({self.answers.probes.get('license', 'checked')})",
         )
         mode = "PAPER" if self.answers.alpaca_is_paper else "LIVE"
         color = "green" if mode == "PAPER" else "bold red"
         table.add_row(
             "Broker", f"Alpaca [{color}]{mode}[/{color}] credentials verified"
         )
-        table.add_row("Exec mode", self.answers.execution_mode)
         table.add_row(
-            "Risk profile",
-            f"{self.answers.risk_profile} — "
-            f"{self.answers.max_trade_allocation_pct * 100:.0f}% per ticker / "
-            f"{self.answers.max_portfolio_risk_pct * 100:.0f}% batch / "
-            f"{self.answers.disaster_stop_pct * 100:.0f}% stop",
+            "Risk",
+            f"{self.answers.max_trade_allocation_pct * 100:.1f}% per trade / "
+            f"{self.answers.max_portfolio_risk_pct * 100:.1f}% total at one time",
         )
+        table.add_row(
+            "Short selling",
+            "ENABLED" if self.answers.allow_short_selling else "disabled",
+        )
+        table.add_row("Exec mode", self.answers.execution_mode)
         table.add_row(
             "Failsafe", "ARMED" if self.answers.local_exit_failsafe else "disabled"
         )
-        verdict = await self._run_broker_probe()
+        verdict = await self._run_broker_probe(
+            self.answers.alpaca_api_key,
+            self.answers.alpaca_secret_key,
+            self.answers.alpaca_is_paper,
+        )
         table.add_row("Live broker probe", verdict)
         console.print(table)
         if verdict.startswith("OK"):
@@ -512,25 +573,12 @@ class OnboardingWizard:
         )
         return False
 
-    async def _run_broker_probe(self) -> str:
+    async def _run_broker_probe(
+        self, api_key: str, secret_key: str, paper: bool
+    ) -> str:
         if self._broker_probe is not None:
-            return await self._broker_probe()
-        from brokers.alpaca_client import AlpacaBroker
-
-        broker = AlpacaBroker(
-            api_key=self.answers.alpaca_api_key,
-            secret_key=self.answers.alpaca_secret_key,
-            paper=self.answers.alpaca_is_paper,
-        )
-        connected = await broker.connect()
-        if connected:
-            try:
-                equity = await broker.get_equity()
-                mode = "PAPER" if self.answers.alpaca_is_paper else "LIVE"
-                return f"OK — connected, equity ${equity:,.2f} ({mode})"
-            except Exception as exc:  # noqa: BLE001
-                return f"OK — connected, but equity failed ({type(exc).__name__})"
-        return "FAIL — Alpaca rejected the credentials"
+            return await self._broker_probe(api_key, secret_key, paper)
+        return await probe_broker_credentials(api_key, secret_key, paper)
 
     def security_notice(self) -> None:
         console.print(
@@ -541,22 +589,57 @@ class OnboardingWizard:
                 "Broker keys are stored only on this disk, transmitted only to "
                 "Alpaca, and printed nowhere — not in logs, not in telemetry.\n"
                 "The Okkults server can instruct when to trade, but can never "
-                "move, hold, or withdraw your funds.",
+                "move, hold, or withdraw your funds.\n"
+                "This client never places resting stop orders; exits are "
+                "server-driven plus an optional local failsafe.",
                 title="[bold cyan]Security notice",
                 border_style="cyan",
             )
         )
 
+    @staticmethod
+    def _env_bool(current: dict[str, str], key: str, default: bool) -> bool:
+        raw = current.get(key)
+        if raw is None or raw.strip() == "":
+            return default
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _current_float(current: dict[str, str], key: str, default: float) -> float:
+        raw = current.get(key)
+        if raw is None or raw.strip() == "":
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _current_optional_float(
+        current: dict[str, str], key: str
+    ) -> float | None:
+        raw = current.get(key)
+        if raw is None or raw.strip() == "":
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
 
 async def probe_broker_credentials(
     api_key: str, secret_key: str, paper: bool
 ) -> str:
-    """Standalone live-credential probe, reused by pre-flight after onboarding."""
+    """Standalone live-credential probe, reused by onboarding and pre-flight."""
     from brokers.alpaca_client import AlpacaBroker
 
-    broker = AlpacaBroker(api_key=api_key, secret_key=secret_key, paper=paper)
-    if not await broker.connect():
-        return "FAIL — Alpaca rejected the credentials"
-    equity = await broker.get_equity()
-    mode = "PAPER" if paper else "LIVE"
-    return f"OK — connected, equity ${equity:,.2f} ({mode})"
+    try:
+        broker = AlpacaBroker(api_key=api_key, secret_key=secret_key, paper=paper)
+        if not await broker.connect():
+            return "FAIL — Alpaca rejected the credentials"
+        equity = await broker.get_equity()
+        mode = "PAPER" if paper else "LIVE"
+        return f"OK — connected, equity ${equity:,.2f} ({mode})"
+    except Exception as exc:  # noqa: BLE001 — probe returns a verdict, never raises
+        return f"FAIL — {type(exc).__name__}: {exc}"

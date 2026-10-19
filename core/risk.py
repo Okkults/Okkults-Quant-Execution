@@ -49,6 +49,9 @@ class SizingResult:
 
 
 TARGET_LABEL: Final[str] = "target allocation"
+MAX_TRADE_ALLOCATION_PCT: Final[float] = 0.10
+MAX_PORTFOLIO_RISK_PCT: Final[float] = 0.30
+DEFAULT_TRADE_ALLOCATION_PCT: Final[float] = 0.05
 
 
 def build_scaling_warning(
@@ -77,8 +80,8 @@ def _effective_pct_for(n_signals: int, target_pct: float, max_total_risk_pct: fl
 def calculate_order_sizes(
     signals: list[dict],
     account_equity: float,
-    target_pct: float,
-    max_total_risk_pct: float,
+    target_pct: float = DEFAULT_TRADE_ALLOCATION_PCT,
+    max_total_risk_pct: float = MAX_PORTFOLIO_RISK_PCT,
     per_trade_notional_cap: float | None = None,
     cash_reserve: float = 0.0,
 ) -> SizingResult:
@@ -95,10 +98,14 @@ def calculate_order_sizes(
     """
     if account_equity < 0:
         raise ValueError("account_equity must be >= 0")
-    if target_pct <= 0 or target_pct > 1:
-        raise ValueError("target_pct must be in (0, 1]")
-    if max_total_risk_pct <= 0 or max_total_risk_pct > 1:
-        raise ValueError("max_total_risk_pct must be in (0, 1]")
+    if target_pct <= 0 or target_pct > MAX_TRADE_ALLOCATION_PCT:
+        raise ValueError(
+            f"target_pct must be in (0, {MAX_TRADE_ALLOCATION_PCT:.0%}]"
+        )
+    if max_total_risk_pct <= 0 or max_total_risk_pct > MAX_PORTFOLIO_RISK_PCT:
+        raise ValueError(
+            f"max_total_risk_pct must be in (0, {MAX_PORTFOLIO_RISK_PCT:.0%}]"
+        )
 
     tradable_equity = max(account_equity - cash_reserve, 0.0)
     n_signals = len(signals)
@@ -162,6 +169,9 @@ def calculate_order_sizes(
 
 
 __all__ = [
+    "DEFAULT_TRADE_ALLOCATION_PCT",
+    "MAX_PORTFOLIO_RISK_PCT",
+    "MAX_TRADE_ALLOCATION_PCT",
     "TARGET_LABEL",
     "OrderBlueprint",
     "SizingResult",

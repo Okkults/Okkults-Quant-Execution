@@ -5,16 +5,18 @@ Responsibilities:
 1. On BATCH_SIGNAL: fetch live equity, size via core.risk, optionally
    require explicit Enter/Spacebar confirmation (semi_auto), then run all
    1-12 orders concurrently with asyncio.gather.
-2. Per fill: rest a broker-side disaster stop using the payload's
-   ``exit_rules.disaster_stop_pct`` (Tier 1 exit; survives user disconnects)
-   and emit FILL_CONFIRMATION telemetry upstream.
-3. On EXIT_SIGNAL (9:30:15 AM open cross): cancel resting stops, dump all
+2. Track only the positions this client opened and emit FILL_CONFIRMATION
+   telemetry upstream. No resting stop orders are ever placed.
+3. On EXIT_SIGNAL (9:30:15 AM open cross): liquidate only client-opened
    positions at market, print the PnL summary table.
-4. On CLOSE_POSITION: cancel that position's stop and dump the requested
-   percentage at market, exactly as the server requested.
+4. On CLOSE_POSITION: close the requested percentage of the client-opened
+   position, exactly as the server requested.
 5. LOCAL_EXIT_FAILSAFE: if the open-cross signal never arrives (server
-   outage) and positions are still open, liquidate locally at 9:30:16 AM
-   ET. Operational safety net only — not alpha.
+   outage) and client-opened positions are still open, liquidate them
+   locally at 9:30:16 AM ET. Operational safety net only — not alpha.
+
+Unrelated holdings already in the broker account are never resized or
+liquidated by this executor; entries for occupied symbols are skipped.
 
 No pricing formula exists here. Every number displayed comes from the wire
 payload or from the broker's own responses.
@@ -28,7 +30,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from rich.console import Console
@@ -42,7 +44,7 @@ from core.risk import (
     build_scaling_warning,
     calculate_order_sizes,
 )
-from signals.listener import ListenerCallbacks, SignalListener
+from signals.listener import ListenerCallbacks
 from signals.protocol import (
     BATCH_SIGNAL_EVENT,
     CLOSE_POSITION_EVENT,
@@ -65,6 +67,12 @@ FAILSAFE_WINDOW_END_ET: tuple[int, int, int] = (16, 0, 0)
 
 ConfirmationWaiter = Callable[[], Awaitable[bool]]
 LocalClock = Callable[[], datetime]
+
+
+class TelemetrySink(Protocol):
+    """Minimal listener surface the executor needs for fill confirmations."""
+
+    async def send(self, payload: dict) -> bool: ...
 
 
 @dataclass
@@ -130,12 +138,12 @@ def seconds_until_next_open_cross(now: datetime | None = None) -> float:
 
 
 class SignalExecutor:
-    """Wires sizing, confirmation, concurrent entry, stops, exits, failsafe."""
+    """Wires sizing, confirmation, concurrent entry, exits, and failsafe."""
 
     def __init__(
         self,
         broker: BaseBroker,
-        listener: SignalListener | None = None,
+        listener: TelemetrySink | None = None,
         settings: Settings | None = None,
         confirm_waiter: ConfirmationWaiter | None = None,
         clock: LocalClock | None = None,
@@ -143,10 +151,13 @@ class SignalExecutor:
         self._broker = broker
         self._listener = listener
         self._settings: Settings = settings if settings is not None else Settings()
+        self._using_terminal_confirm = confirm_waiter is None
         self._confirm_waiter = confirm_waiter or self._terminal_confirmation
         self._clock = clock
         self._open_batches: dict[str, dict[str, EntrySignal]] = {}
-        self._resting_stops: dict[str, str] = {}  # symbol -> resting stop order id
+        # Signed quantities opened by this process. Unrelated broker holdings
+        # never enter this map, so they can never be closed by an exit.
+        self._client_positions: dict[str, float] = {}
         self._exited_since_entry: bool = True
 
     # ------------------------------------------------------------------ #
@@ -173,17 +184,57 @@ class SignalExecutor:
             f"[bold cyan]{BATCH_SIGNAL_EVENT} — batch {batch.batch_id}"
 
         )
-        tradable = [s for s in batch.signals if self._signal_is_fresh(s)]
+        try:
+            existing_positions = await self._broker.get_open_positions()
+        except Exception as exc:  # cannot prove safety -> refuse to trade
+            console.print(
+                f"[bold red]✗ Cannot inspect existing broker positions — "
+                f"{type(exc).__name__}: {exc}. Batch skipped.[/bold red]"
+            )
+            return
+        occupied = {
+            str(p.get("symbol"))
+            for p in existing_positions
+            if float(p.get("qty") or 0) != 0
+        }
+        occupied.update(self._client_positions)
+
+        tradable: list[EntrySignal] = []
         for signal in batch.signals:
-            if signal not in tradable:
+            if not self._signal_is_fresh(signal):
                 console.print(
                     f"[red][!] STALE — {signal.ticker} past entry_cutoff_at; skipping[/red]"
                 )
+                continue
+            if (
+                signal.side.upper() == "SELL"
+                and not self._settings.ALLOW_SHORT_SELLING
+            ):
+                console.print(
+                    f"[yellow][!] SHORT — {signal.ticker} SELL signal ignored "
+                    "(ALLOW_SHORT_SELLING=false)[/yellow]"
+                )
+                continue
+            if signal.ticker in occupied:
+                console.print(
+                    f"[yellow][!] OCCUPIED — {signal.ticker} already has a broker "
+                    "or client-tracked position; skipping so unrelated holdings "
+                    "are never touched.[/yellow]"
+                )
+                continue
+            tradable.append(signal)
         if not tradable:
-            console.print("[yellow][!] No fresh signals — batch skipped[/yellow]")
+            console.print("[yellow][!] No tradable signals — batch skipped[/yellow]")
             return
 
-        equity = await self._broker.get_equity()
+        try:
+            equity = await self._broker.get_equity()
+        except Exception as exc:
+            console.print(
+                f"[bold red]✗ Cannot fetch account equity — "
+                f"{type(exc).__name__}: {exc}. Batch skipped.[/bold red]"
+            )
+            return
         sizing = calculate_order_sizes(
             signals=[s.model_dump() for s in tradable],
             account_equity=equity,
@@ -216,13 +267,30 @@ class SignalExecutor:
         elapsed_ms = (time.monotonic() - began) * 1000.0
         self._print_execution_table(batch, list(outcomes), elapsed_ms)
 
-        await self._place_disaster_stops(list(outcomes))
+        outcomes_list = list(outcomes)
+        self._record_fills(outcomes_list)
         self._open_batches[batch.batch_id] = {s.signal_id: s for s in tradable}
-        self._exited_since_entry = False
         console.print(
-            f"[bold green][{batch.batch_id}] Deployed. Disaster stops rest on the broker "
-            "overnight. Awaiting the 9:30:15 AM open-cross exit signal.[/bold green]"
+            f"[bold green][{batch.batch_id}] Deployed. Tracking only positions "
+            "opened by this client; no resting stops were placed. Awaiting the "
+            "9:30:15 AM open-cross exit signal.[/bold green]"
         )
+
+    def _record_fills(self, outcomes: list[EntryOutcome]) -> None:
+        """Remember signed quantities this client owns; ignore unrelated lots."""
+        for outcome in outcomes:
+            fill = outcome.fill
+            if not outcome.ok or fill is None:
+                continue
+            qty = int(fill.get("qty", outcome.order.shares))
+            signed = qty if outcome.order.side.upper() == "BUY" else -qty
+            symbol = outcome.order.ticker
+            remaining = self._client_positions.get(symbol, 0.0) + signed
+            if remaining:
+                self._client_positions[symbol] = remaining
+            else:
+                self._client_positions.pop(symbol, None)
+        self._exited_since_entry = not self._client_positions
 
     @staticmethod
     def _orders_for(sizing: SizingResult, signal: EntrySignal) -> list[OrderBlueprint]:
@@ -244,7 +312,6 @@ class SignalExecutor:
                 side=order.side,
                 order_type="limit" if signal.limit_price else "market",
                 limit_price=signal.limit_price,
-                stop_price=None,
                 client_order_id=f"okq-{batch.batch_id[:8]}-{signal.signal_id[:12]}-{signal.ticker}",
             )
         except Exception as exc:
@@ -301,6 +368,12 @@ class SignalExecutor:
 
     async def _confirm_before_cutoff(self, signals: list[EntrySignal]) -> bool:
         """90-second (or cutoff-bounded) Enter/Spacebar confirmation gate."""
+        if self._using_terminal_confirm and not sys.stdin.isatty():
+            console.print(
+                "[bold red][!] semi_auto requires an interactive TTY; refusing "
+                "to fire without a human confirmation channel.[/bold red]"
+            )
+            return False
         deadline = min(SEMI_AUTO_CONFIRM_TIMEOUT_S, self._seconds_until_cutoff(signals))
         if deadline <= 0:
             console.print(
@@ -361,50 +434,6 @@ class SignalExecutor:
             return line.strip() == ""
 
     # ------------------------------------------------------------------ #
-    # Tier 1 exit — payload-driven broker-side disaster stop
-    # ------------------------------------------------------------------ #
-    async def _place_disaster_stops(self, outcomes: list[EntryOutcome]) -> None:
-        """Rest broker-side stops per fill, concurrently, anchored to payload pct."""
-        stop_jobs = [
-            self._rest_one_disaster_stop(outcome)
-            for outcome in outcomes
-            if outcome.ok and outcome.fill is not None
-        ]
-        if stop_jobs:
-            await asyncio.gather(*stop_jobs)
-
-    async def _rest_one_disaster_stop(self, outcome: EntryOutcome) -> None:
-        stop_pct = outcome.signal.exit_rules.disaster_stop_pct
-        anchor = outcome.fill.get("avg_fill_price") or outcome.order.reference_price  # type: ignore[union-attr]
-        if not isinstance(anchor, (int, float)) or anchor <= 0:
-            console.print(
-                f"[bold red][!!] No usable fill price for "
-                f"{outcome.order.ticker} — disaster stop NOT placed.[/bold red]"
-            )
-            return
-        stop_price = anchor * (1 - stop_pct)
-        stop_side = "SELL" if outcome.order.side.upper() == "BUY" else "BUY"
-        try:
-            stop = await self._broker.place_order(
-                symbol=outcome.order.ticker,
-                qty=int(outcome.fill.get("qty", outcome.order.shares)),  # type: ignore[union-attr]
-                side=stop_side,
-                order_type="stop",
-                stop_price=round(stop_price, 2),
-            )
-            self._resting_stops[outcome.order.ticker] = str(stop.get("order_id", ""))
-            console.print(
-                f"[cyan][OK][/cyan] Disaster stop resting for {outcome.order.ticker} "
-                f"@ ${stop_price:.2f} ({stop_pct * 100:.1f}% from payload exit_rules)"
-            )
-        except Exception as exc:
-            console.print(
-                f"[bold red][!!] Could not rest disaster stop for "
-                f"{outcome.order.ticker}: {type(exc).__name__}: {exc} — "
-                "position is unprotected overnight.[/bold red]"
-            )
-
-    # ------------------------------------------------------------------ #
     # EXIT — server-driven and local failsafe
     # ------------------------------------------------------------------ #
     async def handle_exit_signal(self, exit_signal: ExitSignal) -> None:
@@ -417,38 +446,100 @@ class SignalExecutor:
             f"{close_signal.percentage:.0f}% — {close_signal.reason}"
         )
         ticker = close_signal.ticker
-        stop_id = self._resting_stops.pop(ticker, None)
-        if stop_id:
+        tracked = self._client_positions.get(ticker, 0.0)
+        if tracked == 0:
             console.print(
-                f"[dim]Cancelled resting stop {stop_id} for {ticker}[/dim]"
+                f"[yellow][!] {ticker} was not opened by this client — refusing "
+                "to touch an unrelated holding.[/yellow]"
             )
+            return
+        qty = min(
+            int(abs(tracked) * close_signal.percentage / 100.0),
+            int(abs(tracked)),
+        )
+        if qty <= 0:
+            console.print(
+                f"[yellow][!] {ticker}: requested percentage rounds to zero "
+                "shares — skipping.[/yellow]"
+            )
+            return
         try:
-            summary = await self._broker.close_position(
-                ticker, close_signal.percentage
-            )
+            summary = await self._broker.close_position(ticker, qty=qty)
             console.print(f"[green][OK][/green] {ticker} — {summary.get('status')}")
         except Exception as exc:
             console.print(
                 f"[red][!] Close failed for {ticker} — {type(exc).__name__}: {exc}[/red]"
             )
+            return
+        remaining = tracked - (qty if tracked > 0 else -qty)
+        if remaining:
+            self._client_positions[ticker] = remaining
+        else:
+            self._client_positions.pop(ticker, None)
+        self._exited_since_entry = not self._client_positions
 
     async def _exit_everything(self, reason: str) -> None:
-        cancelled = await self._broker.cancel_all_orders()
-        console.print(f"[cyan][OK][/cyan] Cancelled {cancelled} resting order(s)")
+        if not self._client_positions:
+            console.print(
+                "[dim]No positions opened by this client to exit; unrelated "
+                "holdings are untouched.[/dim]"
+            )
+            self._exited_since_entry = True
+            return
 
         try:
-            positions = await self._broker.get_open_positions()
+            broker_positions = await self._broker.get_open_positions()
         except Exception as exc:
             console.print(
-                f"[red][!] Unable to list positions — {type(exc).__name__}: {exc}[/red]"
+                f"[red][!] Unable to list positions — {type(exc).__name__}: {exc}. "
+                "Keeping client positions tracked; the failsafe will retry.[/red]"
             )
-            positions = []
+            return
 
-        exits = await self._broker.close_all_positions()
-        self._resting_stops.clear()
+        by_symbol = {
+            str(position.get("symbol")): position for position in broker_positions
+        }
+        closed: list[dict] = []
+        exits: list[dict] = []
+        for symbol, tracked in list(self._client_positions.items()):
+            position = by_symbol.get(symbol)
+            if position is None:
+                console.print(
+                    f"[yellow][!] {symbol}: no broker position found — removing "
+                    "from client tracking.[/yellow]"
+                )
+                self._client_positions.pop(symbol, None)
+                continue
+            available = int(abs(float(position.get("qty") or 0)))
+            desired = min(int(abs(tracked)), available)
+            if desired <= 0:
+                continue
+            try:
+                summary = await self._broker.close_position(symbol, qty=desired)
+            except Exception as exc:
+                console.print(
+                    f"[red][!] Exit failed for {symbol} — "
+                    f"{type(exc).__name__}: {exc}[/red]"
+                )
+                continue
+            exits.append(summary)
+            signed_qty = desired if float(position.get("qty") or 0) > 0 else -desired
+            closed.append({**position, "qty": signed_qty})
+            self._client_positions.pop(symbol, None)
+
         self._open_batches.clear()
-        self._exited_since_entry = True
-        self._print_pnl_table(positions, exits, reason)
+        self._exited_since_entry = not self._client_positions
+        self._print_pnl_table(closed, exits, reason)
+        if self._client_positions:
+            console.print(
+                "[yellow][!] Some client-opened positions remain tracked — the "
+                "failsafe will retry; unrelated holdings are untouched.[/yellow]"
+            )
+        else:
+            console.print(
+                "[bold green]Client-opened positions exited; unrelated holdings "
+                "untouched.[/bold green]"
+            )
 
     def _print_pnl_table(
         self, positions: list[dict], exits: list[dict], reason: str
@@ -497,13 +588,14 @@ class SignalExecutor:
                 f"[{color}]{pnl_display}[/{color}]",
             )
         console.print(table)
-        console.print("[bold green]100% back to cash.[/bold green]")
 
     # ------------------------------------------------------------------ #
     # LOCAL_EXIT_FAILSAFE watchdog
     # ------------------------------------------------------------------ #
     def _in_failsafe_window(self, now: datetime) -> bool:
         local = now.astimezone(ET)
+        if local.weekday() >= 5:  # Alpaca is closed on weekends
+            return False
         start = local.replace(
             hour=FAILSAFE_EXIT_AT[0],
             minute=FAILSAFE_EXIT_AT[1],
@@ -520,17 +612,12 @@ class SignalExecutor:
 
     async def _failsafe_check(self) -> None:
         """One poll cycle of the local liquidation net."""
-        if self._exited_since_entry:
-            return
-        try:
-            positions = await self._broker.get_open_positions()
-        except Exception:
-            return
-        if not positions:
+        if self._exited_since_entry or not self._client_positions:
             return
         console.print(
             "[bold red][FAILSAFE] The 9:30:15 AM EXIT_SIGNAL never arrived "
-            "but positions are open — liquidating locally now.[/bold red]"
+            "but client-opened positions are still tracked — liquidating "
+            "them locally now.[/bold red]"
         )
         await self._exit_everything(reason="LOCAL_FAILSAFE")
 
@@ -542,7 +629,8 @@ class SignalExecutor:
         if not enabled:
             console.print(
                 "[yellow][--] LOCAL_EXIT_FAILSAFE disabled by config — "
-                "positions rely fully on the signal server and disaster stops.[/yellow]"
+                "client-opened positions rely fully on the signal server."
+                "[/yellow]"
             )
             return
         while True:

@@ -19,7 +19,7 @@ COPY . .
 # Non-root runtime user; secrets ride in via -e flags (never baked in)
 RUN useradd --create-home okkults && chown -R okkults /app
 USER okkults
-# HEADLESS=1 tells the terminal to skip interactive bits (wizard still
-# available but not auto-triggered; unattended restarts go straight to run)
+# HEADLESS=1 makes incomplete config fail fast instead of trying to launch
+# the interactive wizard; unattended restarts go straight to pre-flight/run.
 ENV HEADLESS=1
 CMD ["python", "main.py"]

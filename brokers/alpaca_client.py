@@ -17,20 +17,8 @@ from typing import Any
 
 from alpaca.common.exceptions import APIError as AlpacaAPIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import (
-    OrderClass,
-    OrderSide,
-    OrderType,
-    QueryOrderStatus,
-    TimeInForce,
-)
-from alpaca.trading.requests import (
-    GetOrdersRequest,
-    LimitOrderRequest,
-    MarketOrderRequest,
-    StopOrderRequest,
-    TakeProfitRequest,
-)
+from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 from rich.console import Console
 
 from brokers.base import BaseBroker
@@ -92,6 +80,10 @@ class AlpacaBroker(BaseBroker):
         )
         self.paper = paper
         self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
 
     # ------------------------------------------------------------------ #
     # connectivity
@@ -158,14 +150,13 @@ class AlpacaBroker(BaseBroker):
         side: str,
         order_type: str,
         limit_price: float | None = None,
-        stop_price: float | None = None,
         client_order_id: str | None = None,
     ) -> dict:
-        """Place market / limit / stop orders. Returns a normalized dict."""
+        """Place a market or limit order. Returns a normalized dict."""
         order_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
         coid = client_order_id or f"okq-{uuid.uuid4().hex[:12]}"
         notional_type: str
-        req: LimitOrderRequest | StopOrderRequest | MarketOrderRequest
+        req: LimitOrderRequest | MarketOrderRequest
         try:
             if order_type == "limit" and limit_price is not None:
                 req = LimitOrderRequest(
@@ -178,17 +169,6 @@ class AlpacaBroker(BaseBroker):
                     client_order_id=coid,
                 )
                 notional_type = "limit"
-            elif order_type == "stop" and stop_price is not None:
-                req = StopOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=order_side,
-                    type=OrderType.STOP,
-                    time_in_force=TimeInForce.DAY,
-                    stop_price=round(stop_price, 2),
-                    client_order_id=coid,
-                )
-                notional_type = "stop"
             else:
                 req = MarketOrderRequest(
                     symbol=symbol,
@@ -211,87 +191,31 @@ class AlpacaBroker(BaseBroker):
             console.print(f"[red][!] Alpaca rejected {side} {symbol}: {exc}[/red]")
             raise AlpacaBrokerError(f"order rejected for {symbol}: {exc}") from exc
 
-    async def place_bracket_order(
+    async def close_position(
         self,
         symbol: str,
-        qty: int,
-        side: str,
-        stop_price: float,
-        take_profit_price: float | None = None,
+        percentage: float = 100.0,
+        qty: int | None = None,
     ) -> dict:
-        """Bracket entry with a server-side stop (disaster-stop pattern)."""
-        order_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
-        req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=order_side,
-            type=OrderType.MARKET,
-            time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,
-            stop_loss=StopOrderRequest(
-                stop_price=round(stop_price, 2),
-            ),
-            take_profit=(
-                TakeProfitRequest(limit_price=round(take_profit_price, 2))
-                if take_profit_price is not None
-                else None
-            ),
-        )
-        try:
-            raw = await asyncio.to_thread(self._client.submit_order, req)
-            return self._normalize_order(raw, symbol, qty, side)
-        except AlpacaAPIError as exc:
-            console.print(f"[red][!] Alpaca rejected bracket {symbol}: {exc}[/red]")
-            raise AlpacaBrokerError(f"bracket rejected for {symbol}: {exc}") from exc
+        """Close ``percentage``% or an explicit whole-share ``qty`` at market.
 
-    async def close_all_positions(self) -> list[dict]:
-        positions = await self.get_open_positions()
-        results: list[dict] = []
-        for p in positions:
-            try:
-                summary = await self.close_position(p["symbol"], 100.0)
-                results.append(summary)
-            except AlpacaBrokerError as exc:
-                console.print(f"[red][!] Failed closing {p['symbol']}: {exc}[/red]")
-                results.append({"symbol": p["symbol"], "status": "ERROR", "error": str(exc)})
-        return results
-
-    async def close_position(self, symbol: str, percentage: float) -> dict:
-        """Close ``percentage``% of a position at market.
-
-        Uses an opposite-side market order sized to the position; keeps
-        qty in whole shares (floor) so no order is over-submitted.
+        The executor passes the exact tracked quantity and refuses to submit
+        entries for symbols that already hold broker positions. Alpaca nets
+        lots per symbol, so a position opened externally *after* entry cannot
+        be distinguished from the tracked one.
         """
         positions = await self.get_open_positions()
         match = next((p for p in positions if p["symbol"] == symbol), None)
         if match is None:
             raise AlpacaBrokerError(f"no open position for {symbol}")
-        close_qty = int(abs(float(match["qty"])) * percentage / 100.0)
-        close_qty = max(close_qty, 0)
+        available = int(abs(float(match["qty"])))
+        close_qty = qty if qty is not None else int(available * percentage / 100.0)
+        close_qty = min(max(close_qty, 0), available)
         if close_qty == 0:
             return {"symbol": symbol, "status": "SKIPPED", "qty": 0}
         exit_side = "SELL" if float(match["qty"]) > 0 else "BUY"
         fill = await self.place_order(symbol, close_qty, exit_side, "market")
         return {"symbol": symbol, "status": "CLOSED", "raw": fill}
-
-    async def cancel_all_orders(self) -> int:
-        """Cancel every resting order (used at the morning exit).
-
-        Returns the number of cancel calls made.
-        """
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-        open_orders = await asyncio.to_thread(self._client.get_orders, req)
-        count = 0
-        for order in list(open_orders):
-            order_id = str(_attr(order, "id") or "")
-            try:
-                await asyncio.to_thread(self._client.cancel_order_by_id, order_id)
-                count += 1
-            except AlpacaAPIError as exc:
-                console.print(
-                    f"[yellow][!] Cancel failed for order {order_id}: {exc}[/yellow]"
-                )
-        return count
 
     # ------------------------------------------------------------------ #
     # helpers

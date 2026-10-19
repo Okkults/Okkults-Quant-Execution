@@ -132,6 +132,15 @@ def test_no_signals_yields_empty_result() -> None:
     assert result.scaling_applied is False
 
 
+def test_defaults_are_five_and_thirty_percent() -> None:
+    result = calculate_order_sizes(
+        signals=make_signals(1, price=100.0),
+        account_equity=50_000.0,
+    )
+    assert result.effective_pct == 0.05
+    assert result.orders[0].shares == 25
+
+
 def test_invalid_inputs_raise() -> None:
     with pytest.raises(ValueError):
         calculate_order_sizes(
@@ -146,7 +155,20 @@ def test_invalid_inputs_raise() -> None:
     with pytest.raises(ValueError):
         calculate_order_sizes(
             signals=make_signals(1), account_equity=100, target_pct=0.1,
-            max_total_risk_pct=1.5,
+            max_total_risk_pct=0.31,
+        )
+
+
+def test_sizing_engine_enforces_hard_caps() -> None:
+    with pytest.raises(ValueError):
+        calculate_order_sizes(
+            signals=make_signals(1), account_equity=100, target_pct=0.11,
+            max_total_risk_pct=0.30,
+        )
+    with pytest.raises(ValueError):
+        calculate_order_sizes(
+            signals=make_signals(1), account_equity=100, target_pct=0.10,
+            max_total_risk_pct=0.31,
         )
 
 

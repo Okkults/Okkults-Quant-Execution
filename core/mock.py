@@ -3,7 +3,7 @@
 ``python main.py --mock`` drives a fake paper account through:
 
 1. a mock BATCH_SIGNAL with 12 tickers (sized against $50,000 equity)
-2. concurrent execution + disaster stops (payload-driven)
+2. concurrent execution with no resting stops
 3. a server-style EXIT_SIGNAL at the open cross, then the PnL summary
 
 This exists so anyone can prove the client works end-to-end before

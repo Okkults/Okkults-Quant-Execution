@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sys
 from typing import NoReturn
 
 from rich.align import Align
@@ -61,11 +62,12 @@ def ensure_env_file() -> None:
             "ALPACA_API_KEY": "",
             "ALPACA_SECRET_KEY": "",
             "ALPACA_IS_PAPER": "true",
+            "LIVE_TRADING_ACK": "NO",
             "EXECUTION_MODE": "full_auto",
             "MAX_PORTFOLIO_RISK_PCT": "0.30",
-            "MAX_TRADE_ALLOCATION_PCT": "0.10",
+            "MAX_TRADE_ALLOCATION_PCT": "0.05",
             "CASH_RESERVE": "0.0",
-            "DISASTER_STOP_PCT": "0.07",
+            "ALLOW_SHORT_SELLING": "false",
             "LOCAL_EXIT_FAILSAFE": "true",
         },
         ".env",
@@ -143,6 +145,25 @@ async def preflight(settings: Settings) -> bool:
         await stub.connect()
         return False
 
+    if settings.EXECUTION_MODE == "semi_auto" and not sys.stdin.isatty():
+        console.print(
+            "[bold red]✗ semi_auto requires an interactive TTY. Use full_auto "
+            "in headless/cloud mode, or run the terminal in a real terminal."
+            "[/bold red]"
+        )
+        return False
+
+    if not settings.ALPACA_IS_PAPER:
+        console.print(
+            "[bold red]LIVE mode — real money. No resting stops will be placed; "
+            "max 5% default per trade, 10% hard cap, 30% total.[/bold red]"
+        )
+    if settings.ALLOW_SHORT_SELLING:
+        console.print(
+            "[yellow]ALLOW_SHORT_SELLING=true — SELL signals can open short "
+            "positions.[/yellow]"
+        )
+
     from brokers.alpaca_client import AlpacaBroker
 
     broker = AlpacaBroker(
@@ -150,12 +171,26 @@ async def preflight(settings: Settings) -> bool:
         secret_key=settings.ALPACA_SECRET_KEY,
         paper=settings.ALPACA_IS_PAPER,
     )
-    summary = await broker.get_account_summary()
+    try:
+        summary = await broker.get_account_summary()
+        positions = await broker.get_open_positions()
+    except Exception as exc:  # noqa: BLE001 — preflight reports, never crashes
+        console.print(
+            f"[bold red]✗ Alpaca pre-flight failed — "
+            f"{type(exc).__name__}: {exc}[/bold red]"
+        )
+        return False
     mode = "[green]PAPER[/green]" if summary["paper"] else "[bold red]LIVE[/bold red]"
     console.print(
         f"[cyan][OK][/cyan] Alpaca {mode} — status={summary['status']} "
         f"equity=${summary['equity']:,.2f} cash=${summary['cash']:,.2f}"
     )
+    if positions:
+        console.print(
+            f"[yellow][!] {len(positions)} existing broker position(s) detected. "
+            "This terminal is not managing them and will never close them; it "
+            "only tracks positions it opens itself.[/yellow]"
+        )
     return summary["status"] == "ACTIVE"
 
 
@@ -172,12 +207,18 @@ async def run_loop(settings: Settings) -> None:
         secret_key=settings.ALPACA_SECRET_KEY,
         paper=settings.ALPACA_IS_PAPER,
     )
+    if not await broker.connect():
+        console.print(
+            "[bold red]✗ Broker connection failed after pre-flight — refusing "
+            "to arm.[/bold red]"
+        )
+        return
     executor = SignalExecutor(broker=broker, settings=settings)
     listener = SignalListener(
         ws_url=settings.OKKULTS_WS_URL,
         license_key=settings.OKKULTS_LICENSE_KEY,
         callbacks=executor.callbacks(),
-        broker_status=lambda: True,
+        broker_status=lambda: broker.connected,
     )
     tasks = [
         asyncio.create_task(listener.run(), name="signal-listener"),
@@ -187,7 +228,9 @@ async def run_loop(settings: Settings) -> None:
         f"[bold green]ARMED[/bold green] — mode [bold]{settings.EXECUTION_MODE}[/bold] "
         f"({settings.BROKER}, "
         + ("paper" if settings.ALPACA_IS_PAPER else "[bold red]live[/bold red]")
-        + f"). Next open-cross in {seconds_until_next_open_cross() / 3600:.1f}h. "
+        + f"). Risk {settings.MAX_TRADE_ALLOCATION_PCT:.1%}/trade, "
+        f"{settings.MAX_PORTFOLIO_RISK_PCT:.1%} total. No resting stops. "
+        f"Next open-cross in {seconds_until_next_open_cross() / 3600:.1f}h. "
         "Press Ctrl+C to stop (open positions are loudly confirmed, never silently abandoned)."
     )
     console.print("[dim]Entry window: 3:50 PM ET · Exit: 9:30:15 AM ET open cross[/dim]")
@@ -200,11 +243,10 @@ async def run_loop(settings: Settings) -> None:
 
 
 async def shutdown_guard(settings: Settings) -> None:
-    """Ctrl+C handler: warn loudly, ask before closing with positions open."""
+    """Ctrl+C handler: warn loudly; never liquidate unrelated holdings."""
     from brokers.alpaca_client import AlpacaBroker
-    from brokers.base import BaseBroker
 
-    broker: BaseBroker = AlpacaBroker(
+    broker = AlpacaBroker(
         api_key=settings.ALPACA_API_KEY,
         secret_key=settings.ALPACA_SECRET_KEY,
         paper=settings.ALPACA_IS_PAPER,
@@ -217,30 +259,21 @@ async def shutdown_guard(settings: Settings) -> None:
         console.print("[green]No open positions — terminal stopped clean.[/green]")
         return
     console.print(
-        f"[bold red][!!] {len(positions)} OPEN POSITION(S) when shutting down:[/bold red]"
+        f"[bold red][!!] {len(positions)} OPEN POSITION(S) at your broker when "
+        "shutting down:[/bold red]"
     )
     for pos in positions:
         console.print(
-            f"  - {pos['symbol']}: qty={pos['qty']} entry=${float(pos['avg_entry_price']):.2f}"
+            f"  - {pos['symbol']}: qty={pos['qty']} "
+            f"entry=${float(pos['avg_entry_price']):.2f}"
         )
     console.print(
-        "[yellow]Disaster stops are resting server-side regardless. "
-        "Type CLOSE to liquidate now, or ENTER to leave resting stops active."
+        "[yellow]This terminal does not place resting stops and cannot tell "
+        "which of these positions it opened after a restart, so it will not "
+        "liquidate them automatically. Restart before the open to receive the "
+        "EXIT_SIGNAL/failsafe, or manage the positions in your broker app."
         "[/yellow]"
     )
-    try:
-        answer = input("> ").strip().upper()
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
-    if answer == "CLOSE":
-        await broker.close_all_positions()
-        console.print("[bold green]All positions liquidated. 100% back to cash.[/bold green]")
-    else:
-        console.print(
-            "[yellow]Terminal stopped; positions kept with server-side disaster stops. "
-            "Restart later to receive the 9:30 AM EXIT_SIGNAL, or liquidate manually "
-            "in your broker app.[/yellow]"
-        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -254,13 +287,15 @@ def main(argv: list[str] | None = None) -> int:
         from core.executor import SignalExecutor
         from core.mock import MockSignalInjector
 
+        # Deliberately ignore any local .env: the demo always shows defaults.
+        mock_settings = Defaults(_env_file=None)  # type: ignore[call-arg]
         injector = MockSignalInjector()
         executor = SignalExecutor(
             broker=MockBroker(),
             listener=injector.listener,
-            settings=Defaults(),
+            settings=mock_settings,
         )
-        asyncio.run(injector.run_cycle(Defaults(), executor))
+        asyncio.run(injector.run_cycle(mock_settings, executor))
         return 0
 
     ensure_env_file()
@@ -270,10 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         console.print("[red]Pre-flight failed. Re-run `python main.py --onboard` or edit .env.[/red]")
         return 1
 
-    try:
-        asyncio.run(run_loop(settings))
-    except KeyboardInterrupt:
-        console.print()
+    asyncio.run(run_loop(settings))
     return 0
 
 
