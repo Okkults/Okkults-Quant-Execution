@@ -217,10 +217,12 @@ async def preflight(settings: Settings) -> bool:
 
 async def run_loop(settings: Settings, hud: bool = True) -> None:
     from datetime import datetime
+    import webbrowser
 
     from brokers.alpaca_client import AlpacaBroker
-    from core.dashboard import EventFeed, ObservingBroker, observing_callbacks, run_dashboard
+    from core.dashboard import EventFeed, ObservingBroker, observing_callbacks
     from core.executor import SignalExecutor, seconds_until_next_open_cross
+    from core.web_dashboard import DashboardState, start_web_dashboard
     from signals.listener import SignalListener
     from signals.protocol import ET
 
@@ -236,6 +238,7 @@ async def run_loop(settings: Settings, hud: bool = True) -> None:
         )
         return
     feed = EventFeed()
+    web_state = DashboardState()
     observing = ObservingBroker(broker, feed)
     executor = SignalExecutor(broker=observing, settings=settings)
     listener = SignalListener(
@@ -244,6 +247,36 @@ async def run_loop(settings: Settings, hud: bool = True) -> None:
         callbacks=observing_callbacks(executor.callbacks(), feed),
         broker_status=lambda: broker.connected,
     )
+
+    async def refresh_web_state() -> None:
+        while True:
+            account, positions = None, []
+            try:
+                account = await broker.get_account_summary()
+            except Exception:
+                account = None
+            try:
+                positions = await broker.get_open_positions()
+            except Exception:
+                positions = []
+            live_events = feed.snapshot()
+            web_state.push(
+                connected=listener.connected,
+                account=account,
+                positions=positions,
+                events=[
+                    {
+                        "time": e["time"],
+                        "kind": e["kind"],
+                        "detail": e["detail"],
+                    }
+                    for e in live_events
+                ],
+            )
+            import asyncio as _a
+
+            await _a.sleep(2.0)
+
     tasks = [
         asyncio.create_task(listener.run(), name="signal-listener"),
         asyncio.create_task(executor.failsafe_watchdog(), name="failsafe-watchdog"),
@@ -259,10 +292,19 @@ async def run_loop(settings: Settings, hud: bool = True) -> None:
     )
     console.print("[dim]Entry window: 3:50 PM ET · Exit: 9:30:15 AM ET open cross[/dim]")
     if hud:
+        url, http_thread = start_web_dashboard(web_state)
+        console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        tasks.append(
+            asyncio.create_task(refresh_web_state(), name="web-dashboard-state")
+        )
         tasks.append(
             asyncio.create_task(
                 run_dashboard(console, observing, feed, lambda: listener.connected),
-                name="dashboard",
+                name="terminal-panels",
             )
         )
     else:
