@@ -92,12 +92,14 @@ def verify_license_probe(
                         continue
                     # Reached a real WS server but it never confirmed a
                     # subscription — that is a MISMATCH (wrong server URL).
+                    # Keep the word "rejected" so every downstream gate
+                    # (web wizard's historical filter included) fails this.
                     return (
-                        "connected, but the server never confirmed your "
-                        "license (no SUBSCRIBED frame). Usually this means "
-                        "'Signal server URL' points somewhere else than the "
-                        "server that issued this key — re-check the ws:// "
-                        "URL your operator gave you."
+                        "rejected: connected, but the server never confirmed "
+                        "your license (no SUBSCRIBED frame). Usually this "
+                        "means 'Signal server URL' points somewhere else "
+                        "than the server that issued this key — re-check "
+                        "the ws:// URL your operator gave you."
                     )
         except Exception as exc:  # noqa: BLE001 — probe must never crash setup
             name = type(exc).__name__
