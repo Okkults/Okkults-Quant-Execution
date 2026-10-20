@@ -26,17 +26,24 @@ git clone https://github.com/Okkults/Okkults-Quant-Execution.git
 cd Okkults-Quant-Execution
 ```
 
-### 2. Check Python 3.11
+### 2. Run it — one command (handles venv + deps for you)
+
+**macOS / Linux:**
 
 ```bash
-python3.11 --version
+./run.sh
 ```
 
-If that fails: macOS `brew install python@3.11`; Ubuntu/Debian
-`sudo apt install python3.11 python3.11-venv`; Windows install Python 3.11
-from python.org and tick **Add Python to PATH**.
+**Windows** (cmd or PowerShell, both paths work — no `py`, no venv activation,
+no execution-policy changes needed):
 
-### 3. Create the virtual environment and install
+```
+run.bat
+```
+
+Any flags pass straight through: `./run.sh --onboard`, `run.bat --mock`, etc.
+The launchers create `.venv`, install requirements quietly on first run, and
+start the terminal. Manual equivalent (if you insist):
 
 macOS/Linux:
 
@@ -44,30 +51,32 @@ macOS/Linux:
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python main.py
 ```
 
 Windows PowerShell:
 
 ```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\python.exe main.py
 ```
-
-Your prompt should now start with `(.venv)`.
 
 ### 4. Prove it works with zero keys
 
 ```bash
-python main.py --mock
+run.bat --mock      # Windows
+./run.sh --mock     # macOS/Linux
 ```
 
 You should see a simulated 12-ticker batch, 12 `FILLED` rows, and a PnL table.
 
 ### 5. Start the real terminal
 
+Leave the terminal in place; the launcher handles the rest:
+
 ```bash
-python main.py
+run.bat             # Windows
+./run.sh            # macOS/Linux
 ```
 
 No config file needed — a local onboarding page opens in your browser
@@ -95,8 +104,7 @@ step-by-step in the console.
 
 ```bash
 cd Okkults-Quant-Execution
-source .venv/bin/activate        # Windows: .venv\Scripts\Activate.ps1
-python main.py
+./run.sh              # Windows: run.bat
 ```
 
 Everything lands in a `chmod 600 .env` written atomically. Re-runs skip the
@@ -106,12 +114,16 @@ pre-existing broker holdings are never touched.
 
 ### Flags
 
+Any flag passes through the launcher, e.g. `./run.sh --onboard`,
+`run.bat --mock`.
+
 | Command | Behavior |
 | --- | --- |
 | `python main.py` | browser onboarding if unconfigured, otherwise armed run loop |
 | `python main.py --onboard` | force browser onboarding (re-enter/repair config) |
 | `python main.py --onboard --cli` | force the terminal wizard instead of the browser |
 | `python main.py --mock` | full simulated cycle, no keys |
+| `--no-hud` | disable browser + terminal dashboards (plain text logs) |
 
 ## One-line Docker
 
